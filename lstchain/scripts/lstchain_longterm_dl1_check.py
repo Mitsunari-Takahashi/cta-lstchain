@@ -21,6 +21,7 @@ which are beyond certain limits.
 
 import argparse
 import copy
+import glob
 import logging
 from pathlib import Path
 
@@ -86,7 +87,9 @@ def main():
     handler = logging.FileHandler(logfilename, mode='w')
     logging.getLogger().addHandler(handler)
 
-    files = sorted(args.input_dir.glob('datacheck_dl1_LST-1.Run?????.h5'))
+    files = glob.glob(str(args.input_dir.joinpath('datacheck_dl1_LST-1.Run?????.h5')))
+    files.sort()
+    files = [Path(f) for f in files]
 
     if not files:
         raise IOError("No input datacheck files found")
@@ -242,6 +245,10 @@ def main():
 
     dicts = [cosmics, pedestals, flatfield]
 
+    # Prevent more than one datacheck file per run ID
+    # Dict with key: run_id and value: file
+    run_info = {}
+
     # files are of the type datacheck_dl1_LST-1.RunXXXXX.h5
     for file in files:
 
@@ -253,6 +260,17 @@ def main():
 
         runnumber = int(file.name[file.name.find('.Run') + 4:
                                   file.name.find('.Run') + 9])
+
+        # check if the run is duplicated
+        prev_file = run_info.get(runnumber)
+        if prev_file is None:
+            run_info[runnumber] = file
+        else:
+            a.close()
+            raise RuntimeError(
+                f"The datacheck for run {runnumber} has been loaded twice: "
+                f"from path {prev_file} and path {file}"
+            )
 
         # Lists to keep the datacheck tables for cosmics, pedestals and
         # flatfield. The "_no_stars" list will have nans for pixels which

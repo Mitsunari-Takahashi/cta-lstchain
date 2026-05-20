@@ -19,6 +19,7 @@ through the input_dir command-line argument
 
 import glob
 import logging
+import json
 
 import tables
 import gc
@@ -90,6 +91,12 @@ def main():
     run = []
     intensity_hist = []
     delta_t_hist = []
+    picture_thresh = []
+    boundary_thresh = []
+
+    # Prevent more than one datacheck file per run ID
+    # Dict with key: run_id and value: file
+    run_info = {}
 
     for file in tqdm(files):
         a = tables.open_file(file)
@@ -124,6 +131,22 @@ def main():
             np.mean(a.root.dl1datacheck.cosmics.col('dragon_time'), axis=1))
         elapsed_time.append(a.root.dl1datacheck.cosmics.col('elapsed_time'))
 
+        # Datachecks processed before 2025 do not contain config information.
+        # Since the reprocessed files correspond to runs with increased cleaning
+        # settings and the unprocessed files to tailcut 84, we hardcode the values
+        # of the picture and boundary threshold for these unprocessed runs
+        try:
+            config = json.loads(a.root.dl1datacheck.cosmics.attrs['config'])
+            picture_thresh.append(
+                config['tailcuts_clean_with_pedestal_threshold']['picture_thresh']
+            )
+            boundary_thresh.append(
+                config['tailcuts_clean_with_pedestal_threshold']['boundary_thresh']
+            )
+        except:
+            picture_thresh.append(8)
+            boundary_thresh.append(4)
+
         # Compute corrected elapsed time, i.e. remove periods of inactive daq
         # (e.g. busy spikes). For this we use the timestamps (50 per subrun)
         # stored in the datacheck files. Note that it is 50 timestamps taken
@@ -148,9 +171,21 @@ def main():
         corrected_elapsed_time.append(newtime)
 
         subrun_index.append(a.root.dl1datacheck.cosmics.col('subrun_index'))
-        run.append(int(file[file.find('.Run') + 4:file.find('.Run') + 9]))
+        runnumber = int(file[file.find('.Run') + 4:file.find('.Run') + 9])
+        run.append(runnumber)
 
         num_subruns = len(a.root.dl1datacheck.cosmics.col('subrun_index'))
+
+        # check if the run is duplicated
+        prev_file = run_info.get(runnumber)
+        if prev_file is None:
+            run_info[runnumber] = file
+        else:
+            a.close()
+            raise RuntimeError(
+                f"The datacheck for run {runnumber} has been loaded twice: "
+                f"from path {prev_file} and path {file}"
+            )
 
         if 'pedestals' in a.root.dl1datacheck:
             if len(a.root.dl1datacheck.pedestals.col(
@@ -177,8 +212,9 @@ def main():
                         a.root.dl1datacheck.pedestals.col('subrun_index'),
                         a.root.dl1datacheck.pedestals.col('num_events'),
                         a.root.dl1datacheck.pedestals.col('num_cleaned_events')):
-                    dummy[jj] = nn
-                    dummy2[jj] = nn2
+                    new_index = np.where(a.root.dl1datacheck.cosmics.col('subrun_index') == jj)[0][0]
+                    dummy[new_index] = nn
+                    dummy2[new_index] = nn2
                 num_pedestals.append(dummy)
                 num_cleaned_pedestals.append(dummy2)
 
@@ -190,8 +226,9 @@ def main():
                         a.root.dl1datacheck.pedestals.col('charge_mean'),
                         a.root.dl1datacheck.pedestals.col('charge_stddev')):
                     starmask = nns < 1
-                    dummy[jj] = np.nanmean(np.where(starmask, ch1, np.nan))
-                    dummy2[jj] = np.nanmean(np.where(starmask, ch2, np.nan))
+                    new_index = np.where(a.root.dl1datacheck.cosmics.col('subrun_index') == jj)[0][0]
+                    dummy[new_index] = np.nanmean(np.where(starmask, ch1, np.nan))
+                    dummy2[new_index] = np.nanmean(np.where(starmask, ch2, np.nan))
                 diffuse_nsb_mean.append(dummy)
                 diffuse_nsb_std.append(dummy2)
 
@@ -215,8 +252,9 @@ def main():
                         a.root.dl1datacheck.flatfield.col('subrun_index'),
                         a.root.dl1datacheck.flatfield.col('num_events'),
                         a.root.dl1datacheck.flatfield.col('num_cleaned_events')):
-                    dummy[jj] = nn
-                    dummy2[jj] = nn2
+                    new_index = np.where(a.root.dl1datacheck.cosmics.col('subrun_index') == jj)[0][0]
+                    dummy[new_index] = nn
+                    dummy2[new_index] = nn2
                 num_flatfield.append(dummy)
                 num_cleaned_flatfield.append(dummy2)
 
@@ -267,6 +305,8 @@ def main():
     all_dragon_time = []
     all_diffuse_nsb_mean = []
     all_diffuse_nsb_std = []
+    all_picture_thresh = []
+    all_boundary_thresh = []
 
     all_intensity_50 = []
     all_peak_intensity = []
@@ -283,11 +323,12 @@ def main():
 
     # Loop over runs:
     for ncosm, ncosm2, nped, nff, x, t, t2, dth, alt, az, ra, dec, r, sr, dt, \
-        nsap, dnsbm, dnsbs in tqdm(zip(
+        p_th, b_th, nsap, dnsbm, dnsbs in tqdm(zip(
             num_cosmics, num_cleaned_cosmics, num_pedestals, num_flatfield,
             intensity_hist, elapsed_time, corrected_elapsed_time, delta_t_hist,
             mean_alt_tel, mean_az_tel,
             tel_ra, tel_dec, run, subrun_index, dragon_time,
+            picture_thresh, boundary_thresh,
             num_star_affected_pixels, diffuse_nsb_mean, diffuse_nsb_std),
         total=num_total):
 
@@ -334,6 +375,9 @@ def main():
         all_dragon_time.extend(dt)
         all_diffuse_nsb_mean.extend(dnsbm)
         all_diffuse_nsb_std.extend(dnsbs)
+
+        all_picture_thresh.extend(len(sr) * [p_th])
+        all_boundary_thresh.extend(len(sr) * [b_th])
 
         rate_vs_intensity = x / t2[:, None]
         delta_rate_vs_intensity = x ** 0.5 / t2[:, None]
@@ -444,6 +488,55 @@ def main():
     all_corrected_fit_errors = np.array([all_fit_errors[:, 0] * par0_correction,
                                          all_fit_errors[:, 1]]).T
 
+    # Corrections for all subruns (cleaning dependent correction)
+    # The intensity parameter depends on the cleaning settings. Consequently,
+    # the derived CR intensity spectrum and the associated parameters (par0 and par1)
+    # also depend on the cleaning applied to the shower images. To enable a consistent
+    # comparison between runs with different cleaning settings, the effect of cleaning
+    # on the CR intensity spectrum parameters must be corrected.
+    # We apply an empirical correction to par0 and par1 derived from the good-quality
+    # data (i.e. 20221118 - 20230214). The correction is estimated separately on par0
+    # and par1 for each cleaning setting. A single correction value is applied to
+    # all subruns processed with the same image cleaning.
+    # The correction is defined such that the corrected par0 and par1 values match
+    # the values obtained from runs with the tailcut 8 and 4, which is used for
+    # the largest fraction of the data.
+    # The correction for cleaning setting i is:
+    #     mean(par) at tailcut 84  -  mean(par) at tailcut_i
+    # Outliers for tailcut 8 and 4 were removed via 3-sigma clipping.
+    par0_vs_cleaning = np.array([
+        1.733,     # tailcut84
+        1.578,     # tailcut1005
+        1.465,     # tailcut1206
+        1.390,     # tailcut1407
+        1.264,     # tailcut1608
+        1.174      # tailcut1809
+    ])
+    par1_vs_cleaning = np.array([
+        -2.239,    # tailcut84
+        -2.239,    # tailcut1005
+        -2.235,    # tailcut1206
+        -2.267,    # tailcut1407
+        -2.330,    # tailcut1608
+        -2.428     # tailcut1809
+    ])
+    list_pict_cleaning = np.array([8, 10, 12, 14, 16, 18])
+
+    params_vs_cleaning = np.array([par0_vs_cleaning, par1_vs_cleaning]).T
+    reference_params = params_vs_cleaning[0, :]
+
+    unique_picture_threshold = np.sort(np.unique(all_picture_thresh))
+    assert set(unique_picture_threshold).issubset(list_pict_cleaning)
+
+    for pict_th in unique_picture_threshold:
+        # No correction for tailcut 84
+        if pict_th == 8:
+            continue
+        arg_i = np.flatnonzero(pict_th == list_pict_cleaning)[0]
+        correction = reference_params - params_vs_cleaning[arg_i, :]
+        mask = (all_picture_thresh == pict_th)
+        all_corrected_fit_params[mask] += correction
+
     #
     # The dependece with cos zenith of the peak cosmics rate, and intensity at
     # 50% of peak rate are more complicated and we need splines. Also computed
@@ -526,6 +619,8 @@ def main():
                 "elapsed_time": all_elapsed_time,
                 "corrected_elapsed_time": all_corrected_elapsed_time,
                 "delta_t_exp_index": all_dt_exp_index,
+                "picture_thresh": all_picture_thresh,
+                "boundary_thresh": all_boundary_thresh,
                 "cosmics_rate": all_cosmic_rates,
                 "cosmics_cleaned_rate": all_cosmic_cleaned_rates,
                 "intensity_at_half_peak_rate": all_intensity_50,
