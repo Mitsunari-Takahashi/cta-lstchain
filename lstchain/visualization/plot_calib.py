@@ -51,6 +51,21 @@ def plot_calibration_results(ped_data, ff_data, calib_data, run=0, plot_file=Non
     camera = load_camera_geometry()
     camera = camera.transform_to(EngineeringCameraFrame())
 
+    # Guess whether this calibration file comes from gain-selected ped events:
+    # For gain-selected data, the low-gain average & std values should be NaN 
+    # for low gain pedestals, except for pixels which are disabled in the DAQ,
+    # in which case the values are exactly 0. There can also be rare cases, 
+    # for gain-selected data, in which some pixel recorded the low gain in an 
+    # event tagged as pedestal (either due to wrong tagging, or to some light 
+    # accidentally coinciding with the recording of the event). So we now 
+    # require that  a *majority* of the pixels have valid low-gain charge 
+    # std values in order to proceed with the low-gain plotting:
+    if (np.isnan(ped_data.charge_std[1]) | 
+        (ped_data.charge_std[1] == 0.0)).sum() > ped_data.charge_std[1].size/2:
+        channels = [0]  # Just high gain
+    else:
+        channels = [0, 1] # Both gains
+
     # plot open pdf
     if plot_file is not None:
         with PdfPages(plot_file) as pdf:
@@ -65,7 +80,7 @@ def plot_calibration_results(ped_data, ff_data, calib_data, run=0, plot_file=Non
             image = ff_data.charge_median
             mask = ff_data.charge_median_outliers
 
-            for chan in np.arange(2):
+            for chan in channels:
                 pad += 1
                 plt.subplot(pad)
                 plt.tight_layout()
@@ -83,7 +98,7 @@ def plot_calibration_results(ped_data, ff_data, calib_data, run=0, plot_file=Non
 
             image = ff_data.charge_std
             mask = ff_data.charge_std_outliers
-            for chan in np.arange(2):
+            for chan in channels:
                 pad += 1
                 plt.subplot(pad)
                 plt.tight_layout()
@@ -101,7 +116,7 @@ def plot_calibration_results(ped_data, ff_data, calib_data, run=0, plot_file=Non
 
             image = ped_data.charge_median
             mask = ped_data.charge_median_outliers
-            for chan in np.arange(2):
+            for chan in channels:
                 pad += 1
                 plt.subplot(pad)
                 plt.tight_layout()
@@ -119,7 +134,7 @@ def plot_calibration_results(ped_data, ff_data, calib_data, run=0, plot_file=Non
 
             image = ped_data.charge_std
             mask = ped_data.charge_std_outliers
-            for chan in np.arange(2):
+            for chan in channels:
                 pad += 1
                 plt.subplot(pad)
                 plt.tight_layout()
@@ -150,7 +165,7 @@ def plot_calibration_results(ped_data, ff_data, calib_data, run=0, plot_file=Non
             # time
             image = ff_data.time_median
             mask = ff_data.time_median_outliers
-            for chan in np.arange(2):
+            for chan in channels:
                 pad += 1
                 plt.subplot(pad)
                 plt.tight_layout()
@@ -164,7 +179,7 @@ def plot_calibration_results(ped_data, ff_data, calib_data, run=0, plot_file=Non
 
             image = ff_data.relative_gain_median
             mask = calib_data.unusable_pixels
-            for chan in np.arange(2):
+            for chan in channels:
                 pad += 1
                 plt.subplot(pad)
                 plt.tight_layout()
@@ -184,7 +199,7 @@ def plot_calibration_results(ped_data, ff_data, calib_data, run=0, plot_file=Non
             image = calib_data.n_pe
             mask = calib_data.unusable_pixels
             image = np.where(np.isnan(image), 0, image)
-            for chan in np.arange(2):
+            for chan in channels:
                 pad += 1
                 plt.subplot(pad)
                 plt.tight_layout()
@@ -203,7 +218,7 @@ def plot_calibration_results(ped_data, ff_data, calib_data, run=0, plot_file=Non
             pad += 1
             plt.subplot(pad)
             plt.tight_layout()
-            for chan in np.arange(2):
+            for chan in channels:
                 n_pe = calib_data.n_pe[chan]
                 # select good pixels
                 select = np.logical_not(mask[chan])
@@ -226,32 +241,33 @@ def plot_calibration_results(ped_data, ff_data, calib_data, run=0, plot_file=Non
             plt.xlabel("pe", fontsize=20)
             plt.ylabel("pixels", fontsize=20)
 
-            # pe scatter plot
-            pad += 1
-            plt.subplot(pad)
-            plt.tight_layout()
-            HG = calib_data.n_pe[0]
-            LG = calib_data.n_pe[1]
-            HG = np.ma.array(np.where(np.isnan(HG), 0, HG),mask=mask[chan])
-            LG = np.ma.array(np.where(np.isnan(LG), 0, LG),mask=mask[chan])
-            
-            mymin = np.ma.median(LG) - 2 * np.ma.std(LG)
-            mymax = np.ma.median(LG) + 2 * np.ma.std(LG)
-            plt.hist2d(LG, HG, bins=[100, 100])
-            plt.xlabel("LG", fontsize=20)
-            plt.ylabel("HG", fontsize=20)
+            if len(channels) == 2:
+                # pe scatter plot
+                pad += 1
+                plt.subplot(pad)
+                plt.tight_layout()
+                HG = calib_data.n_pe[0]
+                LG = calib_data.n_pe[1]
+                HG = np.ma.array(np.where(np.isnan(HG), 0, HG),mask=mask[chan])
+                LG = np.ma.array(np.where(np.isnan(LG), 0, LG),mask=mask[chan])
 
-            x = np.arange(mymin, mymax)
-            plt.plot(x, x)
-            plt.ylim(mymin, mymax)
-            plt.xlim(mymin, mymax)
-            plt.subplots_adjust(top=0.92)
+                mymin = np.ma.median(LG) - 2 * np.ma.std(LG)
+                mymax = np.ma.median(LG) + 2 * np.ma.std(LG)
+                plt.hist2d(LG, HG, bins=[100, 100])
+                plt.xlabel("LG", fontsize=20)
+                plt.ylabel("HG", fontsize=20)
+
+                x = np.arange(mymin, mymax)
+                plt.plot(x, x)
+                plt.ylim(mymin, mymax)
+                plt.xlim(mymin, mymax)
+                plt.subplots_adjust(top=0.92)
 
             pdf.savefig()
             plt.close()
 
             # figures 3 and 4: histograms
-            for chan in np.arange(2):
+            for chan in channels:
                 n_pe = calib_data.n_pe[chan]
                 dc_to_pe =  calib_data.dc_to_pe[chan]
                 gain_median = ff_data.relative_gain_median[chan]
