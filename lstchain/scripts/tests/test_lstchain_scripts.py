@@ -6,7 +6,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import pkg_resources
+from importlib.metadata import entry_points
 import pytest
 import tables
 from importlib.resources import files
@@ -17,22 +17,30 @@ from ctapipe.instrument import SubarrayDescription
 from ctapipe.io import read_table
 from ctapipe.io import EventSource
 from ctapipe.containers import EventType
+from lstchain.io.provenance import read_dl2_provenance
 
 
 from lstchain.io.config import get_srcdep_config, get_standard_config
-from lstchain.io.io import (dl1_images_lstcam_key, dl1_params_lstcam_key,
-                            dl1_params_tel_mon_cal_key,
-                            dl1_params_tel_mon_flat_key,
-                            dl1_params_tel_mon_ped_key, dl2_params_lstcam_key,
-                            get_dataset_keys, get_srcdep_params)
+from lstchain.io.io import (
+    dl1_images_lstcam_key,
+    dl1_params_lstcam_key,
+    dl1_params_tel_mon_cal_key,
+    dl1_params_tel_mon_flat_key,
+    dl1_params_tel_mon_ped_key,
+    dl2_params_lstcam_key,
+    get_dataset_keys,
+    get_srcdep_params,
+    get_resource_path
+)
+
 
 
 def find_entry_points(package_name):
     """from: https://stackoverflow.com/a/47383763/3838691"""
     entrypoints = [
         ep.name
-        for ep in pkg_resources.iter_entry_points("console_scripts")
-        if ep.module_name.startswith(package_name)
+        for ep in entry_points(group="console_scripts")
+        if ep.value.startswith(package_name)
     ]
     return entrypoints
 
@@ -83,6 +91,13 @@ def merged_simulated_dl1_file(simulated_dl1_file, temp_dir_simulated_files):
     return merged_dl1_file
 
 
+def test_lstchain_mc_r0_to_dl1_default_mc_file(tmp_path):
+    """Run R0 to DL1 script for the default MC file without specifying an input file."""
+    output_file = tmp_path / "dl1_gamma_lstprod2.h5"
+    run_program("lstchain_mc_r0_to_dl1", "-o", tmp_path)
+    assert output_file.is_file()
+
+
 def test_lstchain_mc_r0_to_dl1(simulated_dl1_file):
     assert simulated_dl1_file.is_file()
 
@@ -108,6 +123,19 @@ def test_lstchain_r0_to_r0g(tmp_path, temp_dir_observed_files):
             if event.trigger.event_type == evtype:
                 break
         assert(event.r0.tel[1].waveform.shape[0] == ngains)  
+
+@pytest.mark.private_data
+def test_lstchain_r0g_to_r0v(tmp_path, temp_dir_observed_files):
+    test_data = Path(os.getenv('LSTCHAIN_TEST_DATA', 'test_data'))
+    input_file = temp_dir_observed_files / "R0G/LST-1.1.Run16102.0000_first50" \
+                                           ".fits.fz"
+    pixel_selection_file = test_data / "real/R0DVR/Pixel_selection_LST-1.Run16102.0000.h5"
+    output_dir = temp_dir_observed_files / "R0V"
+    output_dir.mkdir()
+    run_program("lstchain_r0g_to_r0v", "-f", input_file, "-o", output_dir,
+                "--pixselection-file", pixel_selection_file)
+    output_file = output_dir / input_file.name
+    assert output_file.is_file()
 
 @pytest.mark.private_data
 def test_lstchain_data_r0_to_dl1(observed_dl1_files):
@@ -171,11 +199,23 @@ def test_pixmasks_file_validity(observed_dl1_files):
     pixmasks = pixmasks_file.root.selected_pixels_masks.col('pixmask')
     assert pixmasks.sum() < 0.1 * len(pixmasks.flatten())
 
-@pytest.mark.private_data
 @pytest.fixture(scope="session")
 def tune_nsb(mc_gamma_testfile, observed_dl1_files):
     return run_program(
         "lstchain_tune_nsb",
+        "--config",
+        "lstchain/data/lstchain_standard_config.json",
+        "--input-mc",
+        mc_gamma_testfile,
+        "--input-data",
+        observed_dl1_files["dl1_file1"],
+    )
+
+
+@pytest.fixture(scope="session")
+def tune_nsb_waveform(mc_gamma_testfile, observed_dl1_files):
+    return run_program(
+        "lstchain_tune_nsb_waveform",
         "--config",
         "lstchain/data/lstchain_standard_config.json",
         "--input-mc",
@@ -198,6 +238,22 @@ def test_validity_tune_nsb(tune_nsb):
             assert line == '  "transition_charge": 8,'
         if "extra_noise_in_bright_pixels" in line:
             assert line == '  "extra_noise_in_bright_pixels": 0.0'
+
+
+def test_validity_tune_nsb_waveform(tune_nsb_waveform):
+    """
+    The resulting nsb_tuning_rate value of -1 expected in this test is
+    meaningless because the input data do not allow a full test of the
+    functionality. This test is only a formal check that the script runs.
+    """
+    output_lines = tune_nsb_waveform.stdout.splitlines()
+    for line in output_lines:
+        if '"nsb_tuning"' in line:
+            assert line == '  "nsb_tuning": true,'
+        if '"nsb_tuning_rate"' in line:
+            assert line == '  "nsb_tuning_rate": -1.0,'
+        if '"spe_location"' in line:
+            assert line == f'  "spe_location": "{get_resource_path("data/spe_LST1_307tubes_2024-09-06.dat")}"'
 
 
 def test_lstchain_mc_trainpipe(rf_models):
@@ -308,6 +364,7 @@ def test_lstchain_merged_dl1_to_dl2(
         "lstchain_dl1_to_dl2",
         "-f",
         simulated_dl1_file_,
+        "-f",
         merged_simulated_dl1_file,
         "-p",
         rf_models["path"],
@@ -328,6 +385,12 @@ def test_lstchain_dl1_to_dl2(simulated_dl2_file):
     assert "reco_disp_dy" in dl2_df.columns
     assert "reco_src_x" in dl2_df.columns
     assert "reco_src_y" in dl2_df.columns
+    
+    prov = read_dl2_provenance(simulated_dl2_file)
+    assert "activity_name" in prov
+    assert "config" in prov
+    assert "path_models" in prov['config']['DL1ToDL2Tool']
+    assert prov['config']['DL1ToDL2Tool']['path_models'] is not None
 
 
 def test_lstchain_dl1_to_dl2_srcdep(simulated_srcdep_dl2_file):

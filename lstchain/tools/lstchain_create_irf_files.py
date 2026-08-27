@@ -28,13 +28,21 @@ For source-dependent analysis, alpha cut can be used instead of theta cut.
 If you want to generate source-dependent IRFs, source-dep flag should be activated.
 The global alpha cut used to generate IRFs is stored as AL_CUT in the HDU header.
 
+Modified IRFs with true energy scaled by a given factor can be created to evaluate 
+the systematic uncertainty in the light collection efficiency. This can be done by 
+setting a value different from one for the "scale_true_energy" argument present in 
+the DataBinning Component of the configuration file of the IRF creation Tool.
+(The true energy of the MC events will be scaled before filling the IRFs histograms 
+when pyirf commands are used. The effects expected are a non-diagonal energy dispersion
+matrix and a different spectrum).
+                
+
 """
 
 from astropy import table
 from astropy.io import fits
 from astropy.time import Time
 import astropy.units as u
-from traitlets import Undefined
 import numpy as np
 
 from ctapipe.core import (
@@ -136,10 +144,16 @@ class IRFFITSWriter(Tool):
         --global-alpha-cut 10
         --source-dep
 
-    """
+    To build modified IRFs by specifying a scaling factor applying to the true energy (without using a config file):
+    > lstchain_create_irf_files
+        -g /path/to/DL2_MC_gamma_file.h5
+        -o /path/to/irf.fits.gz
+        --scale-true-energy 1.15
+        """
 
     input_gamma_dl2 = traits.Path(
         help="Input MC gamma DL2 file",
+        default_value=None,
         allow_none=True,
         exists=True,
         directory_ok=False,
@@ -148,6 +162,7 @@ class IRFFITSWriter(Tool):
 
     input_proton_dl2 = traits.Path(
         help="Input MC proton DL2 file",
+        default_value=None,
         allow_none=True,
         exists=True,
         directory_ok=False,
@@ -156,6 +171,7 @@ class IRFFITSWriter(Tool):
 
     input_electron_dl2 = traits.Path(
         help="Input MC electron DL2 file",
+        default_value=None,
         allow_none=True,
         exists=True,
         directory_ok=False,
@@ -221,6 +237,7 @@ class IRFFITSWriter(Tool):
         "global-alpha-cut": "DL3Cuts.global_alpha_cut",
         "allowed-tels": "DL3Cuts.allowed_tels",
         "overwrite": "IRFFITSWriter.overwrite",
+        "scale-true-energy": "DataBinning.scale_true_energy"
     }
 
     flags = {
@@ -269,7 +286,7 @@ class IRFFITSWriter(Tool):
                 "Use .fits or .fits.gz."
             )
 
-        if self.input_proton_dl2 and self.input_electron_dl2 is not Undefined:
+        if self.input_proton_dl2 and self.input_electron_dl2 is not None:
             self.only_gamma_irf = False
         else:
             self.only_gamma_irf = True
@@ -316,6 +333,12 @@ class IRFFITSWriter(Tool):
                 p["simulation_info"],
                 p["geomag_params"],
             ) = read_mc_dl2_to_QTable(p["file"])
+
+            
+            if self.data_bin.scale_true_energy != 1.0:
+                p["events"]["true_energy"] *= self.data_bin.scale_true_energy
+                p["simulation_info"].energy_min *= self.data_bin.scale_true_energy
+                p["simulation_info"].energy_max *= self.data_bin.scale_true_energy
 
             p["mc_type"] = check_mc_type(p["file"])
 
@@ -377,8 +400,21 @@ class IRFFITSWriter(Tool):
         migration_bins = self.data_bin.energy_migration_bins()
         source_offset_bins = self.data_bin.source_offset_bins()
 
+        if self.mc_particle["gamma"]["mc_type"] in ["point_like", "ring_wobble"]:
+            # The 4 is semi-arbitray. This keeps the same precision as the previous code
+            mean_fov_offset = np.round(get_mc_fov_offset(self.mc_particle["gamma"]["file"]), 4)
+            fov_offset_bins = [mean_fov_offset - 0.1, mean_fov_offset + 0.1] * u.deg
+            self.log.info(f"Single offset for point like gamma MC with offset {mean_fov_offset}")
+        else:
+            fov_offset_bins = self.data_bin.fov_offset_bins()
+            self.log.info(f"Multiple offset for diffuse gamma MC : {fov_offset_bins}")
+
+            if np.max(fov_offset_bins) > gammas["true_source_fov_offset"].max():
+                self.log.warning(f'The highest FoV offset bin ({np.max(fov_offset_bins)}) is larger than the maximum offset simulated ({gammas["true_source_fov_offset"].max()})')
+
         gammas = self.event_sel.filter_cut(gammas)
         gammas = self.cuts.allowed_tels_filter(gammas)
+        gammas = gammas[gammas['true_source_fov_offset'] <= np.max(fov_offset_bins)]
 
         if self.energy_dependent_gh:
             self.gh_cuts_gamma = self.cuts.energy_dependent_gh_cuts(
@@ -434,29 +470,6 @@ class IRFFITSWriter(Tool):
                         "Using a global Alpha cut of "
                         f"{self.cuts.global_alpha_cut} for point like IRF"
                     )
-
-        if self.mc_particle["gamma"]["mc_type"] in ["point_like", "ring_wobble"]:
-            # The 4 is semi-arbitray. This keeps the same precision as the previous code
-            mean_fov_offset = np.round(get_mc_fov_offset(self.mc_particle["gamma"]["file"]), 4)
-            self.log.info(f"Single offset for point like gamma MC with offset {mean_fov_offset}")
-            fov_offset_bins = [mean_fov_offset - 0.1, mean_fov_offset + 0.1] * u.deg
-        else:
-            fov_offset_bins = self.data_bin.fov_offset_bins()
-            self.log.info("Multiple offset for diffuse gamma MC")
-
-            if self.energy_dependent_theta:
-                fov_offset_bins = [
-                    round(
-                        gammas["true_source_fov_offset"].min().to_value(), 3
-                    ),
-                    round(
-                        gammas["true_source_fov_offset"].max().to_value(), 3
-                    )
-                ] * u.deg
-                self.log.info(
-                    "For RAD MAX, FoV where we have all of the reconstructed "
-                    f"events, is used, {fov_offset_bins}"
-                )
 
         if not self.only_gamma_irf:
             background = table.vstack(
@@ -527,7 +540,13 @@ class IRFFITSWriter(Tool):
             geomag_params["GEOMAG_DELTA"].to_value(u.deg),
             "deg",
         )
-
+        # To avoid an astropy warning, we use HIERARCH cards for keywords longer
+        # than eight characters. Later, they can be accessed like any other
+        # (e.g. hdu.header['ETRUE_SCALE']).
+        extra_headers["HIERARCH ETRUE_SCALE"]= (
+            self.data_bin.scale_true_energy
+        )
+      
         if self.point_like:
             self.log.info("Generating point_like IRF HDUs")
         else:
@@ -692,7 +711,8 @@ class IRFFITSWriter(Tool):
                 self.hdus.append(
                     create_rad_max_hdu(
                         self.theta_cuts["cut"][:, np.newaxis],
-                        reco_energy_bins, fov_offset_bins,
+                        reco_energy_bins, fov_offset_bins[[fov_offset_bins.argmin(),
+                                                           fov_offset_bins.argmax()]],
                         **extra_headers
                     )
                 )

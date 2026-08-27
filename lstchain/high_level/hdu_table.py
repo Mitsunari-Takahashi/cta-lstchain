@@ -14,11 +14,14 @@ import numpy as np
 from astropy.coordinates import AltAz, SkyCoord
 from astropy.coordinates.erfa_astrom import ErfaAstromInterpolator, erfa_astrom
 from astropy.io import fits
+from astropy.stats import circmean
 from astropy.table import QTable, Table
 from astropy.time import Time
 
 from lstchain.__init__ import __version__
-from lstchain.reco.utils import camera_to_altaz, location
+from lstchain.reco.utils import camera_to_altaz
+from ctapipe_io_lst.constants import LST1_LOCATION
+
 
 __all__ = [
     "add_icrs_position_params",
@@ -195,28 +198,24 @@ def create_hdu_index_hdu(file_list, hdu_index_file, overwrite=False):
         t_pnt["HDU_NAME"] = "POINTING"
 
         hdu_index_tables.append(t_pnt)
-        hdu_names = [
-            "EFFECTIVE AREA",
-            "ENERGY DISPERSION",
-            "BACKGROUND",
-            "PSF",
-            "RAD_MAX",
-        ]
 
-        for irf in hdu_names:
-            try:
-                t_irf = t_events.copy()
-                irf_hdu = hdu_list[irf].header["HDUCLAS4"]
+        # 0:PRIMARY, 1:EVENTS, 2:GTI, 3:POINTING, 4-:IRF 
+        for hdu in hdu_list[4:]:
 
-                t_irf["HDU_CLASS"] = irf_hdu.lower()
-                t_irf["HDU_TYPE"] = irf_hdu.lower().strip(
-                    "_" + irf_hdu.lower().split("_")[-1]
-                )
-                t_irf["HDU_NAME"] = irf
-                hdu_index_tables.append(t_irf)
-            except KeyError:
-                log.error(f"Run {t_events['OBS_ID']} does not contain HDU {irf}")
+            # GH_CUTS and AL_CUTS don't have HDUCLAS4 header
+            if hdu.header["EXTNAME"] in ['GH_CUTS', 'AL_CUTS']:
+                continue
 
+            irf_hdu = hdu.header["HDUCLAS4"]
+            
+            t_irf = t_events.copy()
+            t_irf["HDU_CLASS"] = irf_hdu.lower()
+            t_irf["HDU_TYPE"] = irf_hdu.lower().strip(
+                "_" + irf_hdu.lower().split("_")[-1]
+            )
+            t_irf["HDU_NAME"] = hdu.name
+            hdu_index_tables.append(t_irf)
+            
     hdu_index_table = Table(hdu_index_tables)
 
     hdu_index_header = DEFAULT_HEADER.copy()
@@ -259,26 +258,49 @@ def get_timing_params(data, epoch=LST_EPOCH):
     return time_pars, time_utc
 
 
-def get_pointing_params(data, source_pos, time_utc):
+def get_pointing_params(data, source_pos, time_utc, exclude_fraction=0.2):
     """
-    Convert the telescope pointing position for the first event from AltAz
-    into ICRS frame of reference.
+    Convert the telescope pointing directions into ICRS frame of reference,
+    and average them for the run (excluding the first events, for which there
+    may be some mispointing due to not-yet-stable tracking).
+
+    exclude_fraction: fraction of the events that will be excluded from the 
+    averaging (the excluded events are the ones at the beginning of the run)
 
     Note: The angular difference from the source is just used for logging here.
+
+    Returns the average pointing in ICRS frame
     """
+    
     pointing_alt = data["pointing_alt"]
     pointing_az = data["pointing_az"]
 
-    pnt_icrs = SkyCoord(
-        alt=pointing_alt[0],
-        az=pointing_az[0],
-        frame=AltAz(obstime=time_utc[0], location=location),
-    ).transform_to(frame="icrs")
+    max_off_angle = 0.05 * u.deg 
+    # Keep track of how often pointing is beyond max_off_angle w.r.t. the mean
+    # run pointing (computed excluding the beginning of run - see exclude_fraction)
+    
+    first_event = int(exclude_fraction * len(data))
+    with erfa_astrom.set(ErfaAstromInterpolator(300 * u.s)):
+        evtwise_pnt_icrs = SkyCoord(
+            alt=pointing_alt,
+            az=pointing_az,
+            frame=AltAz(obstime=time_utc, location=LST1_LOCATION),
+        ).transform_to(frame="icrs")
+
+    mean_ra = circmean(evtwise_pnt_icrs[first_event:].ra)
+    mean_dec = np.mean(evtwise_pnt_icrs[first_event:].dec)
+    pnt_icrs = SkyCoord(ra=mean_ra, dec=mean_dec, frame="icrs")
+
+    off_fraction = ((pnt_icrs.separation(evtwise_pnt_icrs) > max_off_angle).sum() / 
+                    len(evtwise_pnt_icrs))
+    
+    log.info(f"Mean pointing RA: {mean_ra.to(u.deg):.3f},  Dec: {mean_dec.to(u.deg):.3f}")
+    log.info(f"Fraction of events with pointing beyond {max_off_angle:.3f} of mean pointing: {off_fraction:.6f}")
 
     source_pointing_diff = source_pos.separation(pnt_icrs)
 
     log.info(
-        f"Source pointing difference with camera pointing is {source_pointing_diff:.3f}"
+        f"Angle between source direction and mean telescope pointing is {source_pointing_diff:.3f}"
     )
 
     return pnt_icrs
@@ -294,7 +316,7 @@ def add_icrs_position_params(data, source_pos, time_utc):
     reco_az = data["reco_az"]
 
     reco_altaz = SkyCoord(
-        alt=reco_alt, az=reco_az, frame=AltAz(obstime=time_utc, location=location)
+        alt=reco_alt, az=reco_az, frame=AltAz(obstime=time_utc, location=LST1_LOCATION)
     )
 
     with erfa_astrom.set(ErfaAstromInterpolator(300 * u.s)):
@@ -313,14 +335,15 @@ def fill_reco_altaz_w_expected_pos(data):
     for source-dependent analysis. 
 
     Note: This is just a trick to easily extract ON/OFF events in gammapy
-    analysis. For source-dependent analysis, gammaness and alpha cut are 
+    analysis. For source-dependent analysis, gammaness and alpha cut are
     already applied when creating DL3 file and there is no need to apply additional
     cuts in higher analysis (e.g. on/background region cut in gammapy).
     This function fills the same reconstructed position (AltAz, ICRS frame,
-    derived from the first event) for all events. It is recommended to use 
+    derived from the first event) for all events. It is recommended to use
     `WobbleRegionsFinder` in gammapy to define the source and background region.
     """
-    # Compute the expected source position for the first event 
+    # Compute the expected source position for the first event
+
     obstime = Time(data["dragon_time"][0], scale="utc", format="unix")
     expected_src_x = data["expected_src_x"][0] * u.m
     expected_src_y = data["expected_src_y"][0] * u.m
@@ -342,7 +365,7 @@ def fill_reco_altaz_w_expected_pos(data):
 
     reco_altaz = SkyCoord(
         alt=data["reco_alt"][0], az=data["reco_az"][0],
-        frame=AltAz(obstime=obstime, location=location)
+        frame=AltAz(obstime=obstime, location=LST1_LOCATION)
     )
 
     with erfa_astrom.set(ErfaAstromInterpolator(300 * u.s)):
@@ -387,7 +410,7 @@ def create_event_list(
     tel_list = np.unique(data["tel_id"])
 
     time_params, time_utc = get_timing_params(data)
-    
+
     if not 'RA' in data.colnames:
         data = add_icrs_position_params(data, source_pos, time_utc)
     reco_icrs = SkyCoord(ra=data["RA"], dec=data["Dec"], unit="deg")
@@ -469,6 +492,19 @@ def create_event_list(
     ev_header["DEC_OBJ"] = source_pos.dec.to_value()
     ev_header["FOVALIGN"] = "RADEC"
 
+    ev_header["GEOLON"] = (
+        LST1_LOCATION.lon.to_value(u.deg),
+        "Geographic longitude of telescope (deg)",
+    )
+    ev_header["GEOLAT"] = (
+        LST1_LOCATION.lat.to_value(u.deg),
+        "Geographic latitude of telescope (deg)",
+    )
+    ev_header["ALTITUDE"] = (
+        round(LST1_LOCATION.height.to_value(u.m), 2),
+        "Geographic latitude of telescope (m)",
+    )
+
     # GTI table metadata
     gti_header = DEFAULT_HEADER.copy()
     gti_header["CREATED"] = Time.now().utc.iso
@@ -491,20 +527,12 @@ def create_event_list(
     pnt_header["MJDREFF"] = ev_header["MJDREFF"]
     pnt_header["TIMEUNIT"] = ev_header["TIMEUNIT"]
     pnt_header["TIMESYS"] = ev_header["TIMESYS"]
-    pnt_header["OBSGEO-L"] = (
-        location.lon.to_value(u.deg),
-        "Geographic longitude of telescope (deg)",
-    )
-    pnt_header["OBSGEO-B"] = (
-        location.lat.to_value(u.deg),
-        "Geographic latitude of telescope (deg)",
-    )
-    pnt_header["OBSGEO-H"] = (
-        round(location.height.to_value(u.m), 2),
-        "Geographic latitude of telescope (m)",
-    )
-
     pnt_header["TIMEREF"] = ev_header["TIMEREF"]
+
+    pnt_header["GEOLON"] = ev_header["GEOLON"]
+    pnt_header["GEOLAT"] = ev_header["GEOLAT"]
+    pnt_header["ALTITUDE"] = ev_header["ALTITUDE"]
+
     pnt_header["MEAN_ZEN"] = str(data_pars["ZEN_PNT"])
     pnt_header["MEAN_AZ"] = str(data_pars["AZ_PNT"])
     pnt_header["B_DELTA"] = str(data_pars["B_DELTA"])

@@ -7,7 +7,6 @@ from ctapipe.containers import (
     MuonParametersContainer,
 )
 from ctapipe.coordinates import (
-    CameraFrame,
     TelescopeFrame,
 )
 from ctapipe.image.cleaning import tailcuts_clean
@@ -25,36 +24,11 @@ __all__ = [
     'fill_muon_event',
     'fit_muon',
     'muon_filter',
-    'pixel_coords_to_telescope',
     'radial_light_distribution',
     'tag_pix_thr',
     'update_parameters',
 ]
 
-
-def pixel_coords_to_telescope(geom, equivalent_focal_length):
-    """
-    Get the x, y coordinates of the pixels in the telescope frame
-
-    Parameters
-    ----------
-    geom : `CameraGeometry`
-        Camera geometry
-    equivalent_focal_length: `float`
-        Focal length of the telescope
-
-    Returns
-    -------
-    fov_lon, fov_lat : `floats`
-        Coordinates in  the TelescopeFrame
-    """
-
-    camera_coord = SkyCoord(geom.pix_x, geom.pix_y,
-                            CameraFrame(focal_length=equivalent_focal_length,
-                                        rotation=geom.cam_rotation))
-    tel_coord = camera_coord.transform_to(TelescopeFrame())
-
-    return tel_coord.fov_lon, tel_coord.fov_lat
 
 
 def update_parameters(config, n_pixels):
@@ -98,19 +72,20 @@ def update_parameters(config, n_pixels):
     return params
 
 
-def fit_muon(x, y, image, geom, tailcuts):
+def fit_muon(image, geom, tailcuts=None):
     """
     Fit the muon ring
 
     Parameters
     ----------
-    x, y : `floats`
-        Coordinates in  the TelescopeFrame
     image : `np.ndarray`
         Number of photoelectrons in each pixel
     geom : CameraGeometry
-    tailcuts :`list`
-        Tail cuts for image cleaning
+        transformed into TelescopeFrame
+    tailcuts : `list`
+        Tail cuts for image cleaning.
+        Default is None, such that the tailcuts are calculated for each image.
+        If tailcuts are an input, those indicated will be used.
 
     Returns
     -------
@@ -122,15 +97,40 @@ def fit_muon(x, y, image, geom, tailcuts):
     image_clean: `np.ndarray`
         Image after cleaning
     """
+    
+    if tailcuts is None:
+        # We want to quantify the noise of the image. To do so, we will use the 
+        # negative Q cumulative distribution.
+        negative_Q = np.sort(image[image <= 0])
+        
+        hist, bins = np.histogram(negative_Q, range=(-15,0), bins=30)
+        bins = bins[:-1]
 
+        cumulative = np.cumsum(hist)
+        idx = (np.abs(cumulative - 0.318 * cumulative[-1])).argmin() #Find q closest to standard deviation
+        dev = np.abs(bins[idx])
+        # We want to get, from a single image, a quantity related to the width of the 
+        # noise distribution, but only using the negative side of the distribution of pixel charges 
+        # (because the positive side includes actual signal, i.e. the light from the muon). 
+        # So we look for the value of q below which we find 31.8% of the pixels in the image. 
+        # We consider that "1 sigma" to use it as a reference to determine the image cleaning.
+        # "dev" is just the absolute value of that (it would correspond to the standard deviation 
+        # in case the distribution was gaussian).
+
+        tailcuts = [4*dev,2*dev]   # tailcuts are placed at 4*dev of each image.
+        
+        
     fitter = MuonRingFitter(fit_method='kundu_chaudhuri')
 
     clean_mask = tailcuts_clean(
         geom, image,
         picture_thresh=tailcuts[0],
         boundary_thresh=tailcuts[1],
+        min_number_picture_neighbors = 2
     )
 
+    x = geom.pix_x
+    y = geom.pix_y
     ring = fitter(x, y, image, clean_mask)
 
     max_allowed_outliers_distance = 0.4
@@ -140,17 +140,17 @@ def fit_muon(x, y, image, geom, tailcuts):
     # (along the radial direction)
     # The goal is to improve fit for good rings
     # with very few additional non-ring bright pixels.
+    dist = np.sqrt((x - ring.center_fov_lon) ** 2 +
+                   (y - ring.center_fov_lat) ** 2)
     for _ in (0, 0):  # just to iterate the fit twice more
-        dist = np.sqrt(
-            (x - ring.center_fov_lon) ** 2 + (y - ring.center_fov_lat) ** 2
-        )
         ring_dist = np.abs(dist - ring.radius)
 
         clean_mask *= (ring_dist < ring.radius * max_allowed_outliers_distance)
         ring = fitter(x, y, image, clean_mask)
+        dist = np.sqrt((x - ring.center_fov_lon) ** 2 +
+                       (y - ring.center_fov_lat) ** 2)
 
-    image_clean = image * clean_mask
-    return ring, clean_mask, dist, image_clean
+    return ring, clean_mask, dist
 
 
 def analyze_muon_event(subarray, tel_id, event_id, image, good_ring_config, plot_rings, plots_path):
@@ -196,19 +196,18 @@ def analyze_muon_event(subarray, tel_id, event_id, image, good_ring_config, plot
 
     tel_description = subarray.tels[tel_id]
 
-    cam_rad = (
-                      tel_description.camera.geometry.guess_radius() / tel_description.optics.equivalent_focal_length
-              ) * u.rad
-    geom = tel_description.camera.geometry
-    equivalent_focal_length = tel_description.optics.equivalent_focal_length
+    geom = tel_description.camera.geometry.transform_to(TelescopeFrame())
+    x = geom.pix_x
+    y = geom.pix_y
+
+    fov_rad = geom.guess_radius()
+
     mirror_area = tel_description.optics.mirror_area
 
     # some parameters for analysis and cuts for good ring selection:
     params = update_parameters(good_ring_config, geom.n_pixels)
 
-    x, y = pixel_coords_to_telescope(geom, equivalent_focal_length)
-    muonringparam, clean_mask, dist, image_clean = fit_muon(x, y, image, geom,
-                                                            params['tailcuts'])
+    muonringparam, clean_mask, dist = fit_muon(image, geom)
 
     mirror_radius = np.sqrt(mirror_area / np.pi)  # meters
     dist_mask = np.abs(dist - muonringparam.radius
@@ -224,9 +223,7 @@ def analyze_muon_event(subarray, tel_id, event_id, image, good_ring_config, plot
     pix_ring_2 = image[dist_mask_2]
 
     muonparameters = MuonParametersContainer()
-    muonparameters.containment = ring_containment(
-        muonringparam.radius,
-        muonringparam.center_fov_lon, muonringparam.center_fov_lat, cam_rad)
+    muonparameters.containment = ring_containment(muonringparam, fov_rad)
 
     radial_distribution = radial_light_distribution(
         muonringparam.center_fov_lon,
@@ -267,12 +264,12 @@ def analyze_muon_event(subarray, tel_id, event_id, image, good_ring_config, plot
 
         # We do the calculation of the ring completeness (i.e. fraction of whole circle) using the pixels
         # within the "width" fitted using MuonIntensityFitter
+
         muonparameters.completeness = ring_completeness(
-            x[dist_ringwidth_mask], y[dist_ringwidth_mask],
-            image[dist_ringwidth_mask],
-            muonringparam.radius,
-            muonringparam.center_fov_lon,
-            muonringparam.center_fov_lat,
+            pixel_fov_lon=x[dist_ringwidth_mask], 
+            pixel_fov_lat=y[dist_ringwidth_mask],
+            weights=image[dist_ringwidth_mask],
+            ring=muonringparam,
             threshold=params['ring_completeness_threshold'],
             bins=30)
 
@@ -326,37 +323,39 @@ def analyze_muon_event(subarray, tel_id, event_id, image, good_ring_config, plot
     else:
         good_ring = False
 
-    if (plot_rings and plots_path and good_ring):
-        focal_length = equivalent_focal_length
-        ring_telescope = SkyCoord(muonringparam.center_fov_lon,
-                                  muonringparam.center_fov_lat,
-                                  TelescopeFrame())
+    if plot_rings and plots_path and good_ring:
+        ring_telescope = SkyCoord(
+            muonringparam.center_fov_lon,
+            muonringparam.center_fov_lat,
+            TelescopeFrame(),
+        )
+        centroid = ring_telescope.fov_lon.value, ring_telescope.fov_lat.value
 
-        ring_camcoord = ring_telescope.transform_to(CameraFrame(
-            focal_length=focal_length,
-            rotation=geom.cam_rotation,
-        ))
-        centroid = (ring_camcoord.x.value, ring_camcoord.y.value)
         radius = muonringparam.radius
         width = muonintensityoutput.width
-        ringrad_camcoord = 2 * radius.to(u.rad) * focal_length
-        ringwidthfrac = width / radius
-        ringrad_inner = ringrad_camcoord * (1. - ringwidthfrac)
-        ringrad_outer = ringrad_camcoord * (1. + ringwidthfrac)
 
-        fig, ax = plt.subplots(figsize=(10, 10))
+        ringrad_inner = radius - width
+        ringrad_outer = radius + width
+
+        fig, ax = plt.subplots(figsize=(10, 10), layout="constrained")
+
         plot_muon_event(ax, geom, image * clean_mask, centroid,
-                        ringrad_camcoord, ringrad_inner, ringrad_outer,
+                        radius, ringrad_inner, ringrad_outer,
                         event_id)
 
-        plt.figtext(0.15, 0.20, 'radial std dev: {0:.3f}'. \
-                    format(radial_distribution['standard_dev']))
-        plt.figtext(0.15, 0.18, 'radial excess kurtosis: {0:.3f}'. \
-                    format(radial_distribution['excess_kurtosis']))
-        plt.figtext(0.15, 0.16, 'fitted ring width: {0:.3f}'.format(width))
-        plt.figtext(0.15, 0.14, 'ring completeness: {0:.3f}'. \
-                    format(muonparameters.completeness))
-
+        fig.text(
+            0.15, 0.20,
+            'radial std dev: {0:.3f}'.format(radial_distribution['standard_dev']),
+        )
+        fig.text(
+            0.15, 0.18,
+            'radial excess kurtosis: {0:.3f}'.format(radial_distribution['excess_kurtosis'])
+        )
+        fig.text(0.15, 0.16, 'fitted ring width: {0:.3f}'.format(width))
+        fig.text(
+            0.15, 0.14,
+            'ring completeness: {0:.3f}'.format(muonparameters.completeness)
+        )
         fig.savefig('{}/Event_{}_fitted.png'.format(plots_path, event_id))
 
     if (plot_rings and not plots_path):

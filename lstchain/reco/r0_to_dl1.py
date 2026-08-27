@@ -23,21 +23,21 @@ from ctapipe.image import (
     tailcuts_clean,
 )
 from ctapipe.image import number_of_islands, apply_time_delta_cleaning
-from ctapipe.io import EventSource, HDF5TableWriter, DataWriter 
+from ctapipe.io import EventSource, HDF5TableWriter, DataWriter
 from ctapipe.utils import get_dataset_path
 from traitlets.config import Config
 from ctapipe_io_lst.constants import (
-    PIXEL_INDEX
+    PIXEL_INDEX, N_GAINS, N_PIXELS
 )
+from ctapipe_io_lst.evb_preprocessing import EVBPreprocessingFlag
 
 from . import disp
 from .utils import sky_to_camera
 from .volume_reducer import apply_volume_reduction
 from ..data import NormalizedPulseTemplate
-from ..calib.camera import load_calibrator_from_config
 from ..calib.camera.calibration_calculator import CalibrationCalculator
 from ..image.cleaning import apply_dynamic_cleaning
-from ..image.modifier import tune_nsb_on_waveform, calculate_required_additional_nsb
+from ..image.modifier import calculate_required_additional_nsb, WaveformNsbTuner
 from .reconstructor import TimeWaveformFitter
 from ..image.muon import analyze_muon_event, tag_pix_thr
 from ..image.muon import create_muon_table, fill_muon_event
@@ -56,16 +56,15 @@ from ..io import (
     write_mcheader,
     write_metadata,
     write_simtel_energy_histogram,
-    write_subarray_tables,
+    write_subarray_tables
 )
 
-from ..io.io import add_column_table, extract_simulation_nsb, dl1_params_lstcam_key
+from ..io.io import add_column_table, dl1_params_lstcam_key, get_resource_path
 from ..io.lstcontainers import ExtraImageInfo, DL1MonitoringEventIndexContainer
 from ..paths import parse_r0_filename, run_to_dl1_filename, r0_to_dl1_filename
 from ..visualization.plot_reconstructor import plot_debug
 
 logger = logging.getLogger(__name__)
-
 
 __all__ = [
     'add_disp_to_parameters_table',
@@ -73,7 +72,6 @@ __all__ = [
     'apply_lh_fit',
     'r0_to_dl1',
 ]
-
 
 cleaning_method = tailcuts_clean
 
@@ -168,11 +166,11 @@ def parametrize_image(image, peak_time, signal_pixels, camera_geometry, focal_le
 
 
 def get_dl1(
-    calibrated_event,
-    subarray,
-    telescope_id,
-    dl1_container=None,
-    custom_config={}
+        calibrated_event,
+        subarray,
+        telescope_id,
+        dl1_container=None,
+        custom_config={}
 ):
     """
     Return a DL1ParametersContainer of extracted features from a calibrated event.
@@ -303,9 +301,7 @@ def apply_lh_fit(
             try:
                 lhfit_container = fitter(event=event, telescope_id=telescope_id, dl1_container=dl1_container)
             except Exception:
-                logger.error("Unexpected error encountered in likelihood reconstruction.\n"
-                             "Compiled likelihood reconstruction numbaCC functions may be missing.\n"
-                             "In this case you should run: lstchain/scripts/numba_compil_lhfit.py")
+                logger.error("Unexpected error encountered in likelihood reconstruction.")
                 raise
     else:
         lhfit_container = DL1LikelihoodParametersContainer(lhfit_call_status=-10)
@@ -313,9 +309,9 @@ def apply_lh_fit(
 
 
 def r0_to_dl1(
-    input_filename=None,
-    output_filename=None,
-    custom_config={},
+        input_filename=None,
+        output_filename=None,
+        custom_config={},
 ):
     """
     Chain r0 to dl1
@@ -333,11 +329,10 @@ def r0_to_dl1(
     -------
 
     """
-
     # using None as default and using `get_dataset_path` only inside the function
     # prevents downloading at import time.
     if input_filename is None:
-        get_dataset_path('gamma_test_large.simtel.gz')
+        get_dataset_path('gamma_lstprod2.simtel.gz')
 
     if output_filename is None:
         try:
@@ -359,8 +354,6 @@ def r0_to_dl1(
     metadata = global_metadata()
     write_metadata(metadata, output_filename)
 
-    cal_mc = load_calibrator_from_config(config, subarray)
-
     # minimum number of pe in a pixel to include it
     # in calculation of muon ring time (peak sample):
     min_pe_for_muon_t_calc = 10.
@@ -376,11 +369,10 @@ def r0_to_dl1(
     )
 
     if not is_simu:
-
         # Pulse extractor for muon ring analysis. Same parameters (window_width and _shift) as the one for showers, but
         # using GlobalPeakWindowSum, since the signal for the rings is expected to be very isochronous
-        r1_dl1_calibrator_for_muon_rings = CameraCalibrator(image_extractor_type = config['image_extractor_for_muons'],
-                                                            config=Config(config),subarray = subarray)
+        r1_dl1_calibrator_for_muon_rings = CameraCalibrator(image_extractor_type=config['image_extractor_for_muons'],
+                                                            config=Config(config), subarray=subarray)
 
         # Component to process interleaved pedestal and flat-fields
         calib_config = Config({config['calibration_product']: config[config['calibration_product']]})
@@ -399,6 +391,9 @@ def r0_to_dl1(
     # Write extra information to the DL1 file
     subarray.to_hdf(output_filename)
 
+    allowed_tels = config['source_config']['LSTEventSource'][
+        'allowed_tels']
+
     if is_simu:
         write_mcheader(
             source.simulation_config[source.obs_ids[0]],
@@ -408,43 +403,73 @@ def r0_to_dl1(
             metadata=metadata,
         )
     nsb_tuning = False
-    if 'waveform_nsb_tuning' in config.keys():
+    nsb_tuner = None
+    if 'waveform_nsb_tuning' in config:
         nsb_tuning = config['waveform_nsb_tuning']['nsb_tuning']
         if nsb_tuning:
             if is_simu:
-                nsb_original = extract_simulation_nsb(input_filename)
-                pulse_template = NormalizedPulseTemplate.load_from_eventsource(
-                    subarray.tel[1].camera.readout, resample=True
-                )
-                if 'nsb_tuning_ratio' in config['waveform_nsb_tuning'].keys():
+                pulse_templates = {tel_id: NormalizedPulseTemplate.load_from_eventsource(
+                    subarray.tel[tel_id].camera.readout, resample=True)
+                    for tel_id in config['source_config']['LSTEventSource']['allowed_tels']}
+                if 'nsb_tuning_rate_GHz' in config[
+                    'waveform_nsb_tuning']:
                     # get value from config to possibly extract it beforehand on multiple files for averaging purposes
                     # or gain time
-                    nsb_tuning_ratio = config['waveform_nsb_tuning']['nsb_tuning_ratio']
+                    nsb_tuning_rate = config['waveform_nsb_tuning'][
+                        'nsb_tuning_rate_GHz']
                 else:
                     # extract the pedestal variance difference between the current MC file and the target data
                     # FIXME? fails for multiple telescopes
-                    nsb_tuning_ratio = calculate_required_additional_nsb(input_filename,
-                                                                         config['waveform_nsb_tuning']['target_data'],
-                                                                         config=config)[0]
-                spe = np.loadtxt(config['waveform_nsb_tuning']['spe_location']).T
+                    nsb_tuning_rate, _, _ = calculate_required_additional_nsb(
+                            input_filename,
+                            config['waveform_nsb_tuning']['target_data'],
+                            config=config)
+                spe_location = (config['waveform_nsb_tuning']['spe_location']
+                                or get_resource_path("data/spe_LST1_307tubes_2024-09-06.dat"))
+                spe = np.loadtxt(spe_location).T
                 spe_integral = np.cumsum(spe[1])
                 charge_spe_cumulative_pdf = interp1d(spe_integral, spe[0], kind='cubic',
                                                      bounds_error=False, fill_value=0.,
                                                      assume_sorted=True)
-                allowed_tel = np.zeros(len(nsb_original), dtype=bool)
-                allowed_tel[np.array(config['source_config']['LSTEventSource']['allowed_tels'])] = True
-                logger.info('Tuning NSB on MC waveform from '
-                            + str(np.asarray(nsb_original)[allowed_tel])
-                            + 'GHz to {0:d}%'.format(int(nsb_tuning_ratio * 100 + 100.5))
-                            + ' for telescopes ids ' + str(config['source_config']['LSTEventSource']['allowed_tels']))
+                pre_computed_multiplicity = config['waveform_nsb_tuning'].get('pre_computed_multiplicity', 10)
+
+                logger.info('Tuning NSB on MC waveform by adding ')
+                logger.info(f'{nsb_tuning_rate:.3f} GHz for telescope ids:')
+                logger.info(f'{allowed_tels}')
+
+                # NOTE: mc_image_scaling_factor (in config) can be used to adjust the light 
+                # collection efficiency in the MC to that of data - this is an approximation: 
+                # after the scaling, the fluctuations of the signals will be smaller in MC than 
+                # in data (since more p.e. have been simulated, then it signal scaled down). The 
+                # adjustment can be needed due to poor atmospheric transmission and/or dirty 
+                # mirror, or camera window.
+                # TBD: it is not obvious how the rate of additional nsb (nsb_tuning rate)
+                # obtained from this sort of data would have to be modified (if at all) to get
+                # a good match of the noise after the scaling.
+
+                nsb_per_tel = {tel_id: nsb_tuning_rate * u.GHz for tel_id in
+                               allowed_tels}
+
+                nsb_tuner = WaveformNsbTuner(nsb_per_tel,
+                                             pulse_templates,
+                                             charge_spe_cumulative_pdf,
+                                             pre_computed_multiplicity)
             else:
                 logger.warning('NSB tuning on waveform active in config but file is real data, option will be ignored')
                 nsb_tuning = False
 
     lhfit_fitter = None
-    if 'lh_fit_config' in config.keys():
+    if 'lh_fit_config' in config:
         lhfit_fitter_config = {'TimeWaveformFitter': config['lh_fit_config']}
         lhfit_fitter = TimeWaveformFitter(subarray=subarray, config=Config(lhfit_fitter_config))
+        if lhfit_fitter_config['TimeWaveformFitter']['use_interleaved']:
+            tmp_source = EventSource(input_url=input_filename,
+                                     config=Config(config["source_config"]))
+            if is_simu:
+                lhfit_fitter.get_ped_from_true_signal_less(tmp_source, nsb_tuner)
+            else:
+                lhfit_fitter.get_ped_from_interleaved(tmp_source)
+            del tmp_source
 
     # initialize the writer of the interleaved events 
     interleaved_writer = None
@@ -455,21 +480,26 @@ def r0_to_dl1(
         # create output dir in the data-tree if necessary
         dir = f"{dir}/interleaved"
         os.makedirs(dir, exist_ok=True)
-        if 'dl1' in name: 
+        if 'dl1' in name:
             name = name.replace('dl1', 'interleaved').replace('LST-1.1', 'LST-1')
         else:
             name = f"interleaved_{name}"
         interleaved_output_file = Path(dir, name)
-        interleaved_writer = DataWriter(event_source=source,output_path=interleaved_output_file,config=interleaved_writer_config)
-        interleaved_writer._writer.exclude("/r1/event/telescope/.*", "selected_gain_channel")
+        interleaved_writer = DataWriter(event_source=source, output_path=interleaved_output_file,
+                                        config=interleaved_writer_config)
+        # We do not need the DL1a charges (only the times). So we save a bit 
+        # of space by not writing them out:
+        for tel_id in allowed_tels:
+            interleaved_writer._writer.exclude(f'dl1/event/telescope/images/tel_{tel_id:03d}', 
+                                               'image')
 
-    with HDF5TableWriter( 
-        filename=output_filename,
-        group_name='dl1/event',
-        mode='a',
-        filters=HDF5_ZSTD_FILTERS,
-        add_prefix=True,
-        # overwrite=True,
+    with HDF5TableWriter(
+            filename=output_filename,
+            group_name='dl1/event',
+            mode='a',
+            filters=HDF5_ZSTD_FILTERS,
+            add_prefix=True,
+            # overwrite=True,
     ) as writer:
 
         setup_writer(writer, source.subarray, is_simulation=is_simu)
@@ -486,87 +516,119 @@ def r0_to_dl1(
                 event.simulation.prefix = 'mc'
 
             dl1_container.reset()
-
+            
             # write sub tables
             if is_simu:
                 write_subarray_tables(writer, event, metadata)
-                cal_mc(event)
-
-                if config['mc_image_scaling_factor'] != 1:
-                    rescale_dl1_charge(event, config['mc_image_scaling_factor'])
-
             else:
                 if i == 0:
                     # initialize the telescope
                     # FIXME? LST calibrator is only for one telescope
                     # it should be inside the telescope loop (?)
-
                     tel_id = calibration_calculator.tel_id
 
-
-                    #initialize the event monitoring data
+                    # initialize the event monitoring data
                     event.mon = deepcopy(source.r0_r1_calibrator.mon_data)
-                    for container in [event.mon.tel[tel_id].pedestal, event.mon.tel[tel_id].flatfield, event.mon.tel[tel_id].calibration]:
+                    for container in [event.mon.tel[tel_id].pedestal, event.mon.tel[tel_id].flatfield,
+                                      event.mon.tel[tel_id].calibration]:
                         add_global_metadata(container, metadata)
                         add_config_metadata(container, config)
 
-                    # write the first calibration event (initialized from calibration h5 file)
+                    # write the first calibration event (initialized from
+                    # calibration h5 file, if provided)
                     # TODO: these data are supposed to change table_path with "dl1/monitoring/telescope/CatA" in short future
                     write_calibration_data(writer,
                                            calibration_index,
                                            event.mon.tel[tel_id],
                                            new_ped=True, new_ff=True)
 
+                # Default of absolute_factor is None - needs to be set here
+                event.calibration.tel[tel_id].dl1.absolute_factor = np.ones((2, PIXEL_INDEX.size))
+
+                # PATCH: ctapipe expects relative_factor to be always (ngains, npixels)
+                tel_dl1 = event.calibration.tel[tel_id].dl1
+                rel_factor = tel_dl1.relative_factor
+                if rel_factor is not None:
+                    if rel_factor.ndim == 1:
+                        rel_factor_2d = np.zeros((N_GAINS, N_PIXELS))
+                        sg = event.r1.tel[tel_id].selected_gain_channel
+                        rel_factor_2d[0, sg == 0] = rel_factor[sg == 0]
+                        rel_factor_2d[1, sg == 1] = rel_factor[sg == 1]
+                        tel_dl1.relative_factor = rel_factor_2d
+
                 # flat-field or pedestal:
-                if (event.trigger.event_type == EventType.FLATFIELD or
-                        event.trigger.event_type == EventType.SKY_PEDESTAL):
+                if ((event.trigger.event_type == EventType.FLATFIELD) or
+                    (event.trigger.event_type == EventType.SKY_PEDESTAL)):
+
+                    # NOTE: there used to be a check here of the existence of
+                    # R0 (two-gains) waveform. This was from the time in
+                    # which interleaved events were never gain-selected. Back
+                    # then there were occasionally (in R0G and R0V files)
+                    # events mistagged as interleaved, but which were
+                    # cosmics and had only one gain. This can fail now when
+                    # processing such files. IN CASE OF NEED: Perhaps the check
+                    # can be put back for old run numbers....
 
                     # process interleaved events (pedestals, ff, calibration)
                     new_ped_event, new_ff_event = calibration_calculator.process_interleaved(event)
 
+                    # Check if the event is already calibrated to p.e. by the EVent Builder:
+                    tdp_action = event.lst.tel[tel_id].evt.tdp_action
+                    is_calibrated = False
+                    if tdp_action is not None:
+                        tdp_action = EVBPreprocessingFlag(int(tdp_action))
+                        is_calibrated = EVBPreprocessingFlag.PE_CALIBRATION in tdp_action
+
                     # write monitoring containers if updated
-                    # these data a supposed to be replaced by the Cat_B data in a short future
+                    # these data are supposed to be replaced by the Cat_B data
+                    # in a short future
                     if new_ped_event or new_ff_event:
                         write_calibration_data(writer,
-                                           calibration_index,
-                                           event.mon.tel[tel_id],
-                                           new_ped=new_ped_event, new_ff=new_ff_event)
-                    
-                    # write the calibrated R1 waveform without gain selection
-                    source.r0_r1_calibrator.select_gain = False
-                    source.r0_r1_calibrator.calibrate(event)
-                
+                                               calibration_index,
+                                               event.mon.tel[tel_id],
+                                               new_ped=new_ped_event, new_ff=new_ff_event)
+
+                    # write the calibrated R1 waveform (without gain selection
+                    # if the event is not already gain selected)
+                    if not is_calibrated:
+                        source.r0_r1_calibrator.select_gain = False
+                        source.r0_r1_calibrator.calibrate(event)
+
                     if interleaved_writer is not None:
+                        if interleaved_writer.write_dl1_images:
+                            # Get the DL1 for the interleaved event here, so 
+                            # that it is done for both gains (if present). 
+                            # Will be done later for all events (including 
+                            # interleaved) for the selected gain only
+                            r1_dl1_calibrator(event)
                         interleaved_writer(event)
 
-                    # gain select the events
-                    source.r0_r1_calibrator.select_gain = True
+                    r1 = event.r1.tel[tel_id]
 
-                    r1 = event.r1.tel[tel_id]                   
-                    r1.selected_gain_channel = source.r0_r1_calibrator.gain_selector(event.r0.tel[tel_id].waveform)
-                    r1.waveform = r1.waveform[r1.selected_gain_channel, PIXEL_INDEX]
+                    # gain select the events if not done already:
+                    if r1.selected_gain_channel is None:
+                        source.r0_r1_calibrator.select_gain = True
+                        r1.selected_gain_channel = source.r0_r1_calibrator.gain_selector(event.r0.tel[tel_id].waveform)
+                        # select gain but keep waveform 3d
+                        r1.waveform = r1.waveform[np.newaxis, r1.selected_gain_channel, PIXEL_INDEX]
 
-                    event.calibration.tel[tel_id].dl1.time_shift = \
-                    event.calibration.tel[tel_id].dl1.time_shift[r1.selected_gain_channel, PIXEL_INDEX]
-                    
-                    event.calibration.tel[tel_id].dl1.relative_factor = \
-                    event.calibration.tel[tel_id].dl1.relative_factor[r1.selected_gain_channel, PIXEL_INDEX]
-                    
+    
             # Option to add nsb in waveforms
             if nsb_tuning:
                 # FIXME? assumes same correction ratio for all telescopes
-                for tel_id in config['source_config']['LSTEventSource']['allowed_tels']:
+                for tel_id in allowed_tels:
                     waveform = event.r1.tel[tel_id].waveform
-                    readout = subarray.tel[tel_id].camera.readout
-                    sampling_rate = readout.sampling_rate.to_value(u.GHz)
-                    dt = (1.0 / sampling_rate)
                     selected_gains = event.r1.tel[tel_id].selected_gain_channel
-                    mask_high = (selected_gains == 0)
-                    tune_nsb_on_waveform(waveform, nsb_tuning_ratio, nsb_original[tel_id] * u.GHz,
-                                         dt * u.ns, pulse_template, mask_high, charge_spe_cumulative_pdf)
+                    mask_high = selected_gains == 0
+                    nsb_tuner.tune_nsb_on_waveform(waveform, tel_id, mask_high, subarray)
 
             # create image for all events
             r1_dl1_calibrator(event)
+
+            if is_simu:
+                # Scale all integrated charges in all pixels if requested by user:
+                if config['mc_image_scaling_factor'] != 1:
+                    rescale_dl1_charge(event, config['mc_image_scaling_factor'])
 
             # Temporal volume reducer for lstchain - dl1 level must be filled and dl0 will be overwritten.
             # When the last version of the method is implemented, vol. reduction will be done at dl0
@@ -595,7 +657,6 @@ def r0_to_dl1(
 
                 dl1_container.fill_event_info(event)
 
-
                 # Will determine whether this event has to be written to the
                 # DL1 output or not.
                 if is_simu:
@@ -620,7 +681,7 @@ def r0_to_dl1(
                 if not is_simu:
 
                     calibration_mon = source.r0_r1_calibrator.mon_data.tel[telescope_id].calibration
- 
+
                     dl1_container.ucts_time = 0
                     # convert Time to unix timestamp in (UTC) to keep compatibility
                     # with older lstchain
@@ -634,7 +695,6 @@ def r0_to_dl1(
                     dl1_container.trigger_type = event.lst.tel[telescope_id].evt.tib_masked_trigger
                 else:
                     dl1_container.trigger_type = event.trigger.event_type
-
 
                 dl1_container.az_tel = event.pointing.tel[telescope_id].azimuth
                 dl1_container.alt_tel = event.pointing.tel[telescope_id].altitude
@@ -673,13 +733,13 @@ def r0_to_dl1(
                     bad_pixels = calibration_mon.unusable_pixels[0]
 
                     # Set to 0 unreliable pixels:
-                    image = dl1_tel.image*(~bad_pixels)
+                    image = dl1_tel.image * (~bad_pixels)
 
                     # process only promising events, in terms of # of pixels with large signals:
                     if tag_pix_thr(image):
 
                         # re-calibrate r1 to obtain new dl1, using a more adequate pulse integrator for muon rings
-                        numsamples = event.r1.tel[telescope_id].waveform.shape[1]  # not necessarily the same as in r0!
+                        numsamples = event.r1.tel[telescope_id].waveform.shape[2]  # not necessarily the same as in r0!
                         bad_pixels_hg = calibration_mon.unusable_pixels[0]
                         bad_pixels_lg = calibration_mon.unusable_pixels[1]
 
@@ -687,7 +747,7 @@ def r0_to_dl1(
                         # integrator in case of crazy pixels!  TBD: can this be done in a simpler
                         # way?
                         bad_pixels = bad_pixels_hg | bad_pixels_lg
-                        bad_waveform = np.transpose(np.array(numsamples*[bad_pixels]))
+                        bad_waveform = np.array([np.transpose(np.array(numsamples * [bad_pixels]))]) # (1, npixels, nsamples)
 
                         # print('hg bad pixels:',np.where(bad_pixels_hg))
                         # print('lg bad pixels:',np.where(bad_pixels_lg))
@@ -705,10 +765,10 @@ def r0_to_dl1(
                             good_ring = False
                         else:
                             muonintensityparam, dist_mask, \
-                            ring_size, size_outside_ring, muonringparam, \
-                            good_ring, radial_distribution, \
-                            mean_pixel_charge_around_ring,\
-                            muonpars = \
+                                ring_size, size_outside_ring, muonringparam, \
+                                good_ring, radial_distribution, \
+                                mean_pixel_charge_around_ring, \
+                                muonpars = \
                                 analyze_muon_event(subarray,
                                                    tel_id, event.index.event_id,
                                                    image, good_ring_config=None,
@@ -722,8 +782,8 @@ def r0_to_dl1(
                             mask_hg = bright_pixels & (selected_gain == 0)
                             mask_lg = bright_pixels & (selected_gain == 1)
 
-                            bright_pixels_waveforms_hg = event.r1.tel[telescope_id].waveform[mask_hg, :]
-                            bright_pixels_waveforms_lg = event.r1.tel[telescope_id].waveform[mask_lg, :]
+                            bright_pixels_waveforms_hg = event.r1.tel[telescope_id].waveform[0, mask_hg, :]
+                            bright_pixels_waveforms_lg = event.r1.tel[telescope_id].waveform[0, mask_lg, :]
                             stacked_waveforms_hg = np.sum(bright_pixels_waveforms_hg, axis=0)
                             stacked_waveforms_lg = np.sum(bright_pixels_waveforms_lg, axis=0)
 
@@ -749,10 +809,10 @@ def r0_to_dl1(
 
                 # writes mc information per telescope, including photo electron image
                 if (
-                    is_simu
-                    and config['write_pe_image']
-                    and event.simulation.tel[telescope_id].true_image is not None
-                    and event.simulation.tel[telescope_id].true_image.any()
+                        is_simu
+                        and config['write_pe_image']
+                        and event.simulation.tel[telescope_id].true_image is not None
+                        and event.simulation.tel[telescope_id].true_image.any()
                 ):
                     event.simulation.tel[telescope_id].prefix = ''
                     writer.write(
@@ -790,11 +850,10 @@ def r0_to_dl1(
         muon_output_filename = Path(dir, name)
         table = Table(muon_parameters)
         table.write(muon_output_filename, format='fits', overwrite=True)
-        
+
         # close the interleaved output file and write metadata
         if interleaved_writer is not None:
             interleaved_writer.finish()
-
 
 
 def add_disp_to_parameters_table(dl1_file, table_path, focal):

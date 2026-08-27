@@ -14,10 +14,13 @@ from copy import deepcopy
 import astropy.units as u
 import numpy as np
 import pandas as pd
-from astropy.coordinates import AltAz, SkyCoord, EarthLocation
+from astropy.coordinates import AltAz, SkyCoord
 from astropy.time import Time
 from ctapipe.coordinates import CameraFrame
+from ctapipe.containers import EventType
 from ctapipe_io_lst import OPTICS
+from ctapipe_io_lst.constants import LST1_LOCATION
+from scipy.signal import find_peaks
 
 from . import disp
 
@@ -30,6 +33,7 @@ __all__ = [
     "cartesian_to_polar",
     "clip_alt",
     "compute_alpha",
+    "compute_rf_event_weights",
     "compute_theta2",
     "expand_tel_list",
     "extract_source_position",
@@ -37,6 +41,8 @@ __all__ = [
     "get_effective_time",
     "get_event_pos_in_camera",
     "get_geomagnetic_delta",
+    "get_intensity_threshold",
+    "get_intensity_cut",
     "impute_pointing",
     "linear_imputer",
     "polar_to_cartesian",
@@ -50,10 +56,8 @@ __all__ = [
     "get_events_in_GTI"
 ]
 
-# position of the LST1
-location = EarthLocation.from_geodetic(-17.89139 * u.deg, 28.76139 * u.deg, 2184 * u.m)
 obstime = Time("2018-11-01T02:00")
-horizon_frame = AltAz(location=location, obstime=obstime)
+horizon_frame = AltAz(location=LST1_LOCATION, obstime=obstime)
 
 # Geomagnetic parameters for the LST1 as per
 # https://www.ngdc.noaa.gov/geomag/calculators/magcalc.shtml?#igrfwmm and
@@ -296,7 +300,7 @@ def camera_to_altaz(pos_x, pos_y, focal, pointing_alt, pointing_az, obstime=None
     """
     if not obstime:
         logging.info("No time given. To be use only for MC data.")
-    horizon_frame = AltAz(location=location, obstime=obstime)
+    horizon_frame = AltAz(location=LST1_LOCATION, obstime=obstime)
 
     pointing_direction = SkyCoord(
         alt=clip_alt(pointing_alt), az=pointing_az, frame=horizon_frame
@@ -362,7 +366,7 @@ def radec_to_camera(sky_coordinate, obstime, pointing_alt, pointing_az, focal):
     camera frame: `astropy.coordinates.sky_coordinate.SkyCoord`
     """
 
-    horizon_frame = AltAz(location=location, obstime=obstime)
+    horizon_frame = AltAz(location=LST1_LOCATION, obstime=obstime)
 
     pointing_direction = SkyCoord(
         alt=clip_alt(pointing_alt), az=pointing_az, frame=horizon_frame
@@ -372,7 +376,7 @@ def radec_to_camera(sky_coordinate, obstime, pointing_alt, pointing_az, focal):
         focal_length=focal,
         telescope_pointing=pointing_direction,
         obstime=obstime,
-        location=location,
+        location=LST1_LOCATION,
     )
 
     camera_pos = sky_coordinate.transform_to(camera_frame)
@@ -533,10 +537,9 @@ def filter_events(
 
     if finite_params is not None:
         _finite_params = list(set(finite_params).intersection(list(events_df.columns)))
-        with pd.option_context('mode.use_inf_as_na', True):
-            not_finite_mask = events_df[_finite_params].isna()
+        events_df[_finite_params] = events_df[_finite_params].replace([np.inf, -np.inf], np.nan)
+        not_finite_mask = events_df[_finite_params].isna()
         filter &= ~(not_finite_mask.any(axis=1))
-
         not_finite_counts = (not_finite_mask).sum(axis=0)[_finite_params]
         if (not_finite_counts > 0).any():
             log.warning("Data contains not-predictable events.")
@@ -656,8 +659,19 @@ def get_effective_time(events):
     t_eff: astropy Quantity (in seconds, if input has no units)
     t_elapsed: astropy Quantity (ditto)
     """
-    timestamp = np.array(events["dragon_time"])
-    delta_t = np.array(events["delta_t"])
+
+    # For consistency with the event selection applied in the DL2 to DL3 stage
+    # we require the events to be tagged as "physics triggers". In this way we
+    # count as livetime only periods in which the telescope is recording showers
+    # and properly tagging them. Without this filter the effective time was in 
+    # *rare* occasions (example: run 7199) a few % larger than it should be - it was 
+    # including periods in which showers were tagged "UNKNOWN", which were not 
+    # present in the DL3 file. For most runs the effect is zero.
+    
+    typemask = events["event_type"] == EventType.SUBARRAY.value
+    
+    timestamp = np.array(events["dragon_time"][typemask])
+    delta_t = np.array(events["delta_t"][typemask])
 
     if not isinstance(timestamp, u.Quantity):
         timestamp *= u.s
@@ -672,7 +686,7 @@ def get_effective_time(events):
     # might indicate the DAQ was stopped (e.g. if the table contains more
     # than one run). We set 0.01 s as limit to decide a "break" occurred:
     t_elapsed = np.sum(time_diff[time_diff < 0.01 * u.s])
-    
+
     # delta_t is the time elapsed since the previous triggered event.
     # We exclude the null values that might be set for the first even in a file.
     # Same as the elapsed time, we exclude events with delta_t larger than 0.01 s.
@@ -767,6 +781,141 @@ def get_geomagnetic_delta(zen, az, geomag_dec=None, geomag_inc=None, time=None):
     return delta
 
 
+def get_intensity_threshold(data):
+    """
+    Obtain from a dl2 data table the peak of the differential
+    intensity (I) spectrum, i.e. dR/dI = dN/dt/dI (events/s/p.e.), and
+    determine from it the intensity at which the 50% of the peak rate 
+    is reached on the rising edge.
+    
+    Parameters
+    ----------
+    data: pandas DataFrame or astropy.table.QTable of dl2 events.
+
+    Returns
+    -------
+    xmax: (float) Intensity (in p.e.) at which the peak of dR/dI is reached 
+    
+    ymax: (float) Value of dR/dI at peak (events/s/p.e.)
+
+    x50: (float) Intensity (in p.e.) at which 50% ofthe peak of dR/dI is reached
+    on the rising edge of the peak. Will be nan if not found in the search range
+
+    y50: (float) 50% of the peak dR/dI (events/s/p.e.). Will be nan if not found
+    in the search range
+
+    bincenters: (array) the centers (in log10(intensity)) of the bins of 
+    the intensity histogram used in the calculation (p.e.)
+
+    drdi: (array) the dR/dI values (events/s/p.e.) at the intensity values 
+    in bincenters 
+    
+    
+    """
+    
+    # p.e. range where to look for the "true" cosmics peak
+    min_intensity = 25 
+    max_intensity = 1000  
+    # At lower intensity there are occasioanally fake peaks from stars, 
+    # satellites, meteors...
+    # At higher intensity there are sometimes peak from external light 
+    # sources, and from mis-tagged FF events
+    step = 0.02 # in log10(intensity), for histogramming & peak finding
+    
+    efftime, _ = get_effective_time(data)
+
+    nbins = 1 + int( (np.log10(max_intensity) - np.log10(min_intensity)) / step)
+    bins = np.logspace(np.log10(min_intensity), 
+                       np.log10(max_intensity), nbins)
+    binwidth = np.diff(bins)
+
+    cosmics = data['event_type'] == EventType.SUBARRAY.value
+    nevents, _ = np.histogram(data['intensity'][cosmics], bins=bins)
+    drdi = nevents.astype('float') / (binwidth*efftime.to_value(u.s))
+    bincenters = (bins[1:]*bins[:-1])**0.5 # geometrical mean (log bin center)
+ 
+    log10_drdi = np.nan * np.ones_like(drdi)
+    np.log10(drdi, where=drdi>0, out=log10_drdi) # Avoid empty bins warning 
+
+    peaks, properties = find_peaks(log10_drdi, 
+                                   prominence=0.04, # ~10% in log10 scale
+                                   width=int(0.1/step)) # ~25% in log10 scale
+
+    # If no peak is found, nans are returned (except for the histogram data):
+    if len(peaks) == 0:
+        log.warning('Peak of the intensity spectrum not found!')
+        return np.nan, np.nan, np.nan, np.nan, bincenters, drdi
+    
+    xmax = bincenters[peaks.max()] # The peak at highest intensity (spurious peaks sometimes at low values)
+    ymax = drdi[peaks.max()]
+
+    # Find the intensity for which 50% of peak dR/dI is reached, moving down from the peak, in finer steps
+    # for better precision:
+    finestep = 0.001 # in log10(intensity)
+    xx = np.logspace(np.log10(min_intensity), 
+                     np.log10(xmax), 
+                     1+int((np.log10(xmax) - np.log10(min_intensity))/finestep))[::-1]
+
+    # Linear interpolation in dR/dI (differential rate) vs. log10(intensity/p.e.):    
+    yy = np.interp(np.log10(xx), np.log10(bincenters), drdi)
+
+    x50 = np.nan
+    y50 = np.nan
+    for xxx, yyy in zip(xx, yy):
+        if yyy < 0.5 * ymax:
+            x50 = xxx
+            y50 = np.interp(np.log10(xxx), np.log10(bincenters), drdi)
+            break
+
+    # If the 50% of peak rate is not found, x50 and y50 will be returned as nan
+    # In some cases this may be because the cosmic-ray dR/dI peak merges with a 
+    # lower-intensity peak from star-illuminated pixels, meteors, satellites...
+    # The data may still be usable, and in that case we should probably apply the
+    # default low intensity cut (50 p.e.). If data turn out to have some more 
+    # serious problem, that should be determined elsewhere.
+
+    if np.isnan(x50):
+        log.warning('Rising edge (50%) of intensity spectrum peak not found in the expected range!')
+        log.warning('Perhaps the peak overlaps with an anomalous peak at lower intensity?')
+    
+    return xmax, ymax, x50, y50, bincenters, drdi
+
+
+def get_intensity_cut(data):
+    """
+    Obtain from a dl2 data table the recommended minimum intensity
+    cut to be applied in the event selection as a "software trigger"
+    to improve the agreement between data and MC.
+    
+    Parameters
+    ----------
+    data: pandas DataFrame or astropy.table.QTable of dl2 events.
+
+    Returns
+    -------
+    intensity_cut: (p.e.) Recommended intensity cut (both in data and MC)
+    to achieve a good match between data and MC
+    """
+
+    # Factor by which we multiply the "intensity threshold" (intensity at which
+    # 50% of peak rate dR/dI is reached) to obtain the (minimum) intensity cut. 
+    factor = 1.3 
+    # This value results in ~50 p.e. for the bulk of the LST1 data taken in dark 
+    # conditions (this cut provides good data-MC agreement in image parameters,
+    # as shown in the LST1 performance paper, ApJ 956
+
+    default_cut = 50 # p.e.
+    # We return the default of 50 p.e., if factor * intensity_threshold is below it. 
+    
+    _, _, intensity_at_50pc_peak_rate, _, _, _ = get_intensity_threshold(data)
+    intensity_cut = np.maximum(default_cut, factor * intensity_at_50pc_peak_rate)
+
+    if intensity_cut == default_cut:
+        log.info(f'The default cut of {default_cut} p.e. is fine for these data!')
+
+    return intensity_cut
+
+
 def correct_bias_focal_length(events, effective_focal_length=29.30565*u.m, inplace=True):
     """
     Fix the bias introduced by reconstructing the events direction with the nominal focal length.
@@ -838,7 +987,7 @@ def get_events_in_GTI(events, CatB_cal_table):
 
     Parameters
     ----------
-    events : pandas DataFrame or astropy.table.QTable 
+    events : pandas DataFrame or astropy.table.QTable
         Data frame or table of DL1 or DL2 events.
     CatB_cal_table: table of CatB calibration applied to the events (dl1_mon_tel_CatB_cal_key)
 
@@ -852,3 +1001,74 @@ def get_events_in_GTI(events, CatB_cal_table):
     gti_mask = gti[events['calibration_id']]
 
     return events[gti_mask]
+
+def compute_rf_event_weights(events):
+    """
+    Compute event-wise weights. Can be used for correcting for the different
+    statistics present in each pointing node of the MC training sample,
+    to avoid "jumps" in the performance of the random forests
+
+    Parameters
+    ----------
+    events : `~pd.DataFrame`
+        DL1 parameters dataframe. The table is modified in place by the
+    addition of a column called 'weight' (unless it exists already). The
+    column contains an event-wise weight to be used in the Random Forest
+    training, to give each of the telescope pointings in the training sample
+    the same overall weight in the training.
+
+    Returns
+    -------
+
+    pointings: ndarray of shape (number_of_pointings, 2) Alt Az (in radians)
+        for each of the identified telescope pointings in the input MC sample
+
+    weight_per_pointing: ndarray [number_of_pointings] weight for each of the
+    identified pointings. The weight is equal to the mean number of training
+    events per node divided by the number of training events in the specific
+    node. If used as sample_weight in scikit-learn, each node will have the
+    same total weight in the training of the Random Forests
+
+    """
+
+    if 'weight' in events.columns:
+        log.warning("compute_rf_event_weights: DL2 table already contains")
+        log.warning("a column called weight. It will NOT be overwritten!")
+        return None, None
+
+    # Add a 'weight' column to the input table
+    weights = np.array(np.ones(len(events)))
+
+    # First identify existing telescope pointings in the sample:
+    # Convert to degrees and round to avoid potential
+    # rounding issues:
+    alt = np.round(events['alt_tel'], decimals=5)
+    az = np.round(events['az_tel'], decimals=5)
+    pointings = np.unique([alt, az], axis=1).T
+
+    # Find the total statistics in each of the pointings:
+    stats = []
+    for tel_alt_az in pointings:
+        mask = (np.isclose(tel_alt_az[0], events['alt_tel'],
+                           atol=1e-5, rtol=0) &
+                np.isclose(tel_alt_az[1], events['az_tel'],
+                           atol=1e-5, rtol=0))
+        stats.append(mask.sum())
+
+    stats = np.array(stats)
+    weight_per_pointing = stats.mean() / stats
+
+    # Now set the weights.
+    # Weight in a given node will be mean_events_per_node / n_events_in_node
+
+    for ipointing, tel_alt_az in enumerate(pointings):
+        mask = (np.isclose(tel_alt_az[0], events['alt_tel'],
+                           atol=1e-5, rtol=0) &
+                np.isclose(tel_alt_az[1], events['az_tel'],
+                           atol=1e-5, rtol=0))
+        weights[mask] = weight_per_pointing[ipointing]
+
+    events['weight'] = weights
+
+    # return the identified pointings and weights set (for checks)
+    return pointings, weight_per_pointing

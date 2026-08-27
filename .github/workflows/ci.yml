@@ -17,12 +17,12 @@ jobs:
   pyflakes:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
-          python-version: 3.9
+          python-version: 3.11
 
       - name: pyflakes
         run: |
@@ -35,46 +35,81 @@ jobs:
 
     defaults:
       run:
-        shell: bash -el {0}
+        shell: bash -leo pipefail {0}
 
+    # Note about scikit-learn versions (09/07/2025):
+    # - scikit-learn 1.2 is required to load previous models - see https://github.com/cta-observatory/cta-lstchain/issues/1366
+    # - it requires python 3.11 
+    # - at the moment we test that this version can still be installed but this should be removed in the future, when new models are available
     strategy:
       matrix:
-        python-version: ["3.9", "3.10", "3.11"]
-        ctapipe-version: ["v0.19.2"]
+        include:
+          - python-version: "3.11"
+            ctapipe-version: "v0.25.1"
+          - python-version: "3.12"
+            ctapipe-version: "v0.25.1"
+          - python-version: "3.13"
+            ctapipe-version: "v0.25.1"
+          - python-version: "3.11"
+            ctapipe-version: "v0.25.1"
+            sklearn-version: "1.2"
+            name: "scikit-learn 1.2"
 
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
       - name: Prepare mamba installation
         env:
           PYTHON_VERSION: ${{ matrix.python-version }}
+          SKLEARN_VERSION: ${{ matrix.sklearn-version }}
         run: |
+          ENV_FILE="environment.yml"
+          if [ -n "$SKLEARN_VERSION" ]; then
+            echo "Running with scikit-learn $SKLEARN_VERSION"
+            NEW_ENV_FILE="environment-sklearn-$SKLEARN_VERSION.yml"
+            cp environment.yml "$NEW_ENV_FILE"
+            sed -i -e "s/scikit-learn>=1.2/scikit-learn=$SKLEARN_VERSION/g" "$NEW_ENV_FILE"
+            sed -i -e "/scikit-learn=$SKLEARN_VERSION/a \  - numpy<2.0.0" "$NEW_ENV_FILE"
+            ENV_FILE="$NEW_ENV_FILE"
+            
+            ENV_FILE="$NEW_ENV_FILE"
+          fi
+
           # setup correct python version
-          sed -i -e "s/- python=.*/- python=$PYTHON_VERSION/g" environment.yml
+          sed -i -e "s/- python=.*/- python=$PYTHON_VERSION/g" "$ENV_FILE"
+          echo "environment-file=$ENV_FILE" >> $GITHUB_ENV
 
       - name: Mamba setup
-        uses: mamba-org/provision-with-micromamba@v14
+        uses: mamba-org/setup-micromamba@v3
         with:
-          environment-name: "lst-dev"
-          environment-file: environment.yml
+          environment-file: ${{ env.environment-file }}
+          cache-downloads: true
 
       - name: Install dependencies
         env:
           PYTHON_VERSION: ${{ matrix.python-version }}
           CTAPIPE_VERSION: ${{ matrix.ctapipe-version }}
-
+          SKLEARN_VERSION: ${{ matrix.sklearn-version }}
         run: |
           python --version
           echo "Installing additional pip packages"
 
-          echo "pip install -e ."
-          pip install -e .
+          CTAPIPE_REQ="git+https://github.com/cta-observatory/ctapipe@$CTAPIPE_VERSION"
+          LSTCHAIN_REQ="-e ."
+          if [ -n "$SKLEARN_VERSION" ]; then
+            pip install "numpy<2.0.0"
+            LSTCHAIN_REQ="$LSTCHAIN_REQ numpy<2.0.0"
+            CTAPIPE_REQ="$CTAPIPE_REQ numpy<2.0.0"
+          fi
+          
+          echo "pip install $LSTCHAIN_REQ"
+          pip install $LSTCHAIN_REQ
 
           pip install pytest-cov 'coverage!=6.3.0' pytest-xdist
           # we install ctapipe using pip to be able to select any commit, e.g. the current master
-          pip install "git+https://github.com/cta-observatory/ctapipe@$CTAPIPE_VERSION"
+          pip install $CTAPIPE_REQ
 
           which pip
           pip freeze
@@ -84,29 +119,36 @@ jobs:
           TEST_DATA_USER: ${{ secrets.test_data_user }}
           TEST_DATA_PASSWORD: ${{ secrets.test_data_password }}
         run: |
+          if [ -z "$TEST_DATA_USER" ]; then
+            echo "This repository needs private test data that is not available in CI runs on forks."
+            echo "Please re-open this PR from a branch pushed directly to the repository"
+            echo "If you do not have access, please ask a maintainer"
+            exit 1
+          fi
           ./download_test_data.sh
 
       - name: Tests
         run: |
           pytest -n auto --dist loadscope --cov --cov-report=xml -m 'private_data or not private_data' lstchain
 
-      - uses: codecov/codecov-action@v1
+      - uses: codecov/codecov-action@v4
         with:
-          # disable gcov, not needed
-          functionalities: gcov
+          fail_ci_if_error: true
+          token: ${{ secrets.CODECOV_TOKEN }}
+
 
   docs:
     needs: pyflakes
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
-          python-version: 3.9
+          python-version: "3.10"
 
       - name: Install doc dependencies
         run: |
@@ -116,7 +158,7 @@ jobs:
           git describe --tags
           python -c 'import lstchain; print(lstchain.__version__)'
       - name: Build docs
-        run: cd docs && make html SPHINXOPTS="-W --keep-going -n --color -j auto"
+        run: cd docs && make html SPHINXOPTS="-W --keep-going -n --color"
 
       - name: Deploy to gihub pages
         # only run on push to main

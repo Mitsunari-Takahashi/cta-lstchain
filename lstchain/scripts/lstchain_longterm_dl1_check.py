@@ -21,6 +21,7 @@ which are beyond certain limits.
 
 import argparse
 import copy
+import glob
 import logging
 from pathlib import Path
 
@@ -43,7 +44,7 @@ from bokeh.models import (
     Range1d,
     Whisker,
 )
-from bokeh.models.widgets import Tabs, Panel
+from bokeh.models.layouts import Tabs, TabPanel
 from bokeh.plotting import figure
 from ctapipe.coordinates import EngineeringCameraFrame
 # from ctapipe.instrument import SubarrayDescription
@@ -86,7 +87,9 @@ def main():
     handler = logging.FileHandler(logfilename, mode='w')
     logging.getLogger().addHandler(handler)
 
-    files = sorted(args.input_dir.glob('datacheck_dl1_LST-1.Run?????.h5'))
+    files = glob.glob(str(args.input_dir.joinpath('datacheck_dl1_LST-1.Run?????.h5')))
+    files.sort()
+    files = [Path(f) for f in files]
 
     if not files:
         raise IOError("No input datacheck files found")
@@ -242,6 +245,10 @@ def main():
 
     dicts = [cosmics, pedestals, flatfield]
 
+    # Prevent more than one datacheck file per run ID
+    # Dict with key: run_id and value: file
+    run_info = {}
+
     # files are of the type datacheck_dl1_LST-1.RunXXXXX.h5
     for file in files:
 
@@ -253,6 +260,17 @@ def main():
 
         runnumber = int(file.name[file.name.find('.Run') + 4:
                                   file.name.find('.Run') + 9])
+
+        # check if the run is duplicated
+        prev_file = run_info.get(runnumber)
+        if prev_file is None:
+            run_info[runnumber] = file
+        else:
+            a.close()
+            raise RuntimeError(
+                f"The datacheck for run {runnumber} has been loaded twice: "
+                f"from path {prev_file} and path {file}"
+            )
 
         # Lists to keep the datacheck tables for cosmics, pedestals and
         # flatfield. The "_no_stars" list will have nans for pixels which
@@ -829,7 +847,7 @@ def plot(filename='longterm_dl1_check.h5', batch=False, tel_id=1):
 
     # Flat field pixel charges (just for the mean; the std dev may be strongly
     # affected by stars), in pe.
-    ff_charge = 73.5
+    ff_charge = 69
     ff_charge_tolerance = 0.1  # relative tolerance
 
     # Limits of FF mean pixel time (ns) w.r.t. camera average:
@@ -869,7 +887,7 @@ def plot(filename='longterm_dl1_check.h5', batch=False, tel_id=1):
     min_average_ff_charge = ff_charge * (1 - ff_charge_tolerance)
     max_average_ff_rel_time_stdev = ff_max_rel_time_stdev
 
-    max_average_ff_time_stdev = 1.2
+    max_average_ff_time_stdev = 1.3
     min_average_ff_time = 12  # ns
     max_average_ff_time = 23  # ns
     max_average_ff_charge_stdev = 11  # pe
@@ -929,7 +947,7 @@ def plot(filename='longterm_dl1_check.h5', batch=False, tel_id=1):
 
     # Plot interleaved pedestal rates
 
-    page0 = Panel()
+    page0 = TabPanel()
     fig_ped_rates = show_graph(x=runtime, y=ped_rate, ey=err_ped_rate,
                                xlabel='date',
                                ylabel='Interleaved pedestals rate (Hz)',
@@ -994,13 +1012,13 @@ def plot(filename='longterm_dl1_check.h5', batch=False, tel_id=1):
     pad_height = 350
     row1 = [fig_ped_rates, fig_ff_rates]
     row2 = [fig_cosmic_rates, fig_muring_rates]
-    grid0 = gridplot([row1, row2], sizing_mode=None, width=pad_width,
-                     height=pad_height)
+    grid0 = gridplot([row1, row2],
+                     width=pad_width, height=pad_height)
     page0.child = grid0
     page0.title = 'Event rates'
 
 
-    page0a = Panel()
+    page0a = TabPanel()
 
     num_events = runsummary['num_cosmics'] + runsummary['num_pedestals'] + \
                  runsummary['num_flatfield']
@@ -1025,14 +1043,14 @@ def plot(filename='longterm_dl1_check.h5', batch=False, tel_id=1):
                          size=4, xtype='datetime', ytype='linear',
                          point_labels=run_titles)
     row2 = [fig_tib]
-    grid0a = gridplot([row1, row2], sizing_mode=None,
+    grid0a = gridplot([row1, row2],
                       width=pad_width, height=pad_height)
     page0a.child = grid0a
     page0a.title = 'Trigger tags'
 
 
 
-    page0b = Panel()
+    page0b = TabPanel()
     items = []
     for trigtype in ['ucts', 'tib']:
         for evttype in ['pedestals', 'flatfield', 'cosmics']:
@@ -1052,12 +1070,12 @@ def plot(filename='longterm_dl1_check.h5', batch=False, tel_id=1):
     row1 = items[:3]
     row2 = items[3:]
 
-    grid0b = gridplot([row1, row2], sizing_mode=None,
+    grid0b = gridplot([row1, row2],
                       width=pad_width, height=pad_height)
     page0b.child = grid0b
     page0b.title = 'Trigger tags'
 
-    page0c = Panel()
+    page0c = TabPanel()
     altmin = np.rad2deg(runsummary['min_altitude'])
     altmean = np.rad2deg(runsummary['mean_altitude'])
     altmax = np.rad2deg(runsummary['max_altitude'])
@@ -1097,8 +1115,8 @@ def plot(filename='longterm_dl1_check.h5', batch=False, tel_id=1):
 
     row1 = [fig_altitude, fig_azimuth]
     row2 = [fig_dec, fig_ra]
-    grid0c = gridplot([row1, row2], sizing_mode=None, width=pad_width,
-                      height=pad_height)
+    grid0c = gridplot([row1, row2],
+                      width=pad_width, height=pad_height)
     page0c.child = grid0c
     page0c.title = 'Pointing'
 
@@ -1107,7 +1125,7 @@ def plot(filename='longterm_dl1_check.h5', batch=False, tel_id=1):
     pixel_problems = []
     check_name = []
 
-    page1 = Panel()
+    page1 = TabPanel()
     pad_width = 350
     pad_height = 370
 
@@ -1126,12 +1144,12 @@ def plot(filename='longterm_dl1_check.h5', batch=False, tel_id=1):
     pixel_problems.append(too_high)
     check_name.append("Too high pedestal charge std dev")
 
-    grid1 = gridplot([row1, row2], sizing_mode='scale_height',
-                     height=pad_height)
+    grid1 = gridplot([row1, row2])
+
     page1.child = grid1
     page1.title = 'Interleaved pedestals'
 
-    page2 = Panel()
+    page2 = TabPanel()
 
     mean = np.array(pixwise_runsummary['ff_pix_charge_mean'])
     stddev = np.array(pixwise_runsummary['ff_pix_charge_stddev'])
@@ -1158,13 +1176,12 @@ def plot(filename='longterm_dl1_check.h5', batch=False, tel_id=1):
                        'Flat-Field charge std dev (pe)',
                        run_titles,
                        display_range=[0, 14])
-    grid2 = gridplot([row1, row2], sizing_mode='scale_height',
-                     height=pad_height)
+    grid2 = gridplot([row1, row2])
 
     page2.child = grid2
     page2.title = 'Interleaved flat field, charge'
 
-    page3 = Panel()
+    page3 = TabPanel()
 
     mean = np.array(pixwise_runsummary['ff_pix_rel_time_mean'])
     stddev = np.array(pixwise_runsummary['ff_pix_rel_time_stddev'])
@@ -1198,12 +1215,12 @@ def plot(filename='longterm_dl1_check.h5', batch=False, tel_id=1):
     pixel_problems.append(too_high)
     check_name.append("Too high flatfield relative time std dev")
 
-    grid3 = gridplot([row1, row2], sizing_mode='scale_height',
-                     height=pad_height)
+    grid3 = gridplot([row1, row2])
+
     page3.child = grid3
     page3.title = 'Interleaved flat field, time'
 
-    page4 = Panel()
+    page4 = TabPanel()
 
     pulse_rate_above_10 = \
         np.array(pixwise_runsummary['cosmics_pix_fraction_pulses_above10'] *
@@ -1248,12 +1265,12 @@ def plot(filename='longterm_dl1_check.h5', batch=False, tel_id=1):
     check_name.extend(["Too low rate of >30 pe cosmics pulses",
                        "Too high rate of >30 pe cosmics pulses"])
 
-    grid4 = gridplot([row1, row2], sizing_mode='scale_height',
-                     height=pad_height)
+    grid4 = gridplot([row1, row2])
+
     page4.child = grid4
     page4.title = 'Cosmics'
 
-    page4b = Panel()
+    page4b = TabPanel()
 
     # For the image centroids distributions we use the table without cuts in
     # pixels with nearby stars, because centroid is not really as pixel-wise
@@ -1274,34 +1291,35 @@ def plot(filename='longterm_dl1_check.h5', batch=False, tel_id=1):
             'Cosmics, >200 pe image cog distribution (/s)',
             run_titles, display_range=(0, 1.1*np.nanmax(cogs)))
 
-    grid4b = gridplot([row1, row2], sizing_mode='scale_height',
-                     height=pad_height)
+    grid4b = gridplot([row1, row2])
+
     page4b.child = grid4b
     page4b.title = 'Cosmics'
 
     # Now we make a page with a summary of the pixel problems (in what
     # fraction of the runs each pixel showed a given problem)
-    page4c = Panel()
+    page4c = TabPanel()
     fraction_of_runs = np.array(pixel_problems) / len(runsummary)
 
-    row = show_camera(fraction_of_runs, engineering_geom,
-                      pad_width,
-                      'Fraction of runs', titles=check_name,
-                      showlog=False,
-                      display_range=(1e-6, 1.1))
+    row1 = show_camera(fraction_of_runs, engineering_geom,
+                       pad_width,
+                       'Fraction of runs', titles=check_name,
+                       showlog=False,
+                       display_range=(1e-6, 1.1))
     # We set the minimum to non-zero so pixels without problems appear in grey
 
-    row[0].title = 'issue'
+    row1[0].children[0].title = 'issue'
+
     # show in red pixels with issues in more than half of the runs (for some
     # reason this does not work until one clicks on the z-range slider of one
     # of the plots):
-    row[2].value=(1e-6, 0.5)
+    row1[0].children[1].value=(1e-6, 0.5)
 
-    grid4c = gridplot([row], height=pad_height)
+    grid4c = gridplot([row1])
     page4c.child = grid4c
     page4c.title = 'Pixel problems'
 
-    page5 = Panel()
+    page5 = TabPanel()
     pad_width = 550
     pad_height = 350
     fig_mu_effi = show_graph(x=pd.to_datetime(runsummary['time'], origin='unix',
@@ -1353,12 +1371,12 @@ def plot(filename='longterm_dl1_check.h5', batch=False, tel_id=1):
     row1 = [fig_mu_effi, fig_mu_width]
     row2 = [fig_mu_intensity, fig_mu_hg_peak]
 
-    grid5 = gridplot([row1, row2], sizing_mode=None, width=pad_width,
-                     height=pad_height)
+    grid5 = gridplot([row1, row2],
+                     width=pad_width, height=pad_height)
     page5.child = grid5
     page5.title = "Muons"
 
-    page6 = Panel()
+    page6 = TabPanel()
     pad_width = 550
     pad_height = 350
     fig_ped = show_graph(x=pd.to_datetime(runsummary['time'],
@@ -1407,12 +1425,12 @@ def plot(filename='longterm_dl1_check.h5', batch=False, tel_id=1):
     row1 = [fig_ped, fig_ped_stddev]
     row2 = [fig_ped_clean_fraction, fig_num_stars]
 
-    grid6 = gridplot([row1, row2], sizing_mode=None, width=pad_width,
-                     height=pad_height)
+    grid6 = gridplot([row1, row2],
+                     width=pad_width, height=pad_height)
     page6.child = grid6
     page6.title = "Interleaved pedestals, averages"
 
-    page7 = Panel()
+    page7 = TabPanel()
     pad_width = 550
     pad_height = 350
     fig_flatfield = show_graph(x=pd.to_datetime(runsummary['time'],
@@ -1480,12 +1498,12 @@ def plot(filename='longterm_dl1_check.h5', batch=False, tel_id=1):
     row1 = [fig_flatfield, fig_ff_stddev]
     row2 = [fig_ff_time, fig_ff_time_std, fig_ff_rel_time_std]
 
-    grid7 = gridplot([row1, row2], sizing_mode=None, width=pad_width,
-                     height=pad_height)
+    grid7 = gridplot([row1, row2],
+                     width=pad_width, height=pad_height)
     page7.child = grid7
     page7.title = "Interleaved FF, averages"
 
-    page8 = Panel()
+    page8 = TabPanel()
     pad_width = 550
     pad_height = 350
 
@@ -1523,8 +1541,8 @@ def plot(filename='longterm_dl1_check.h5', batch=False, tel_id=1):
         Range1d(0., 1.5 * np.max(average_pulse_rate_above_30))
 
     row1 = [fig_rate10pe, fig_rate30pe]
-    grid8 = gridplot([row1], sizing_mode=None, width=pad_width,
-                     height=pad_height)
+    grid8 = gridplot([row1],
+                     width=pad_width, height=pad_height)
     page8.child = grid8
     page8.title = "Cosmics, averages"
 
@@ -1577,7 +1595,7 @@ def show_graph(x, y, xlabel, ylabel, ey=None, eylow=None, eyhigh=None,
     source = ColumnDataSource(data=dict(x=x, y=y))
     if point_labels is not None:
         source.data['point_labels'] = point_labels
-    datapoints = fig.circle(x='x', y='y', size=size, source=source)
+    datapoints = fig.scatter(x='x', y='y', size=size, source=source)
 
     if eylow is None:
         eylow = ey

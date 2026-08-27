@@ -28,6 +28,7 @@ import glob
 import logging
 import os
 from warnings import simplefilter
+from pathlib import Path
 
 # I had enough of those annoying future warnings, hence:
 simplefilter(action='ignore', category=FutureWarning)
@@ -72,7 +73,8 @@ optional.add_argument('--omit-pdf', action='store_true',
 optional.add_argument('--batch', '-b', action='store_true',
                       help='Run the script without plotting output'
                       )
-
+optional.add_argument('--log', dest='log_file', type=Path, default=None,
+                    help='Log file name')
 
 def main():
 
@@ -81,9 +83,18 @@ def main():
     logging.basicConfig(level=logging.INFO, format='%(message)s')
     logger = logging.getLogger(__name__)
 
+    if args.log_file is not None:
+        handler = logging.FileHandler(args.log_file, mode='w')
+        logging.getLogger().addHandler(handler)
+
     # Avoid "lies outside the camera" warnings from Camera geometry:
     geomlogger = logging.getLogger('ctapipe.instrument.camera')
     geomlogger.setLevel(logging.ERROR)
+
+    # Avoid provenance info messages ("No activity has been explicitly 
+    # started..."), which come from call to load_camera_geometry():
+    provlogger = logging.getLogger('ctapipe.core.provenance')
+    provlogger.setLevel(logging.WARNING)
 
     if len(unknown) > 0:
         ukn = ''
@@ -92,6 +103,7 @@ def main():
         logger.error('Unknown options: ' + ukn)
         exit(-1)
 
+    logger.info('Executing {}'.format(__name__))
     logger.info('input files: {}'.format(args.input_file))
     logger.info('output directory: {}'.format(args.output_dir))
 
@@ -114,7 +126,8 @@ def main():
 
     # otherwise, do the full analysis to produce the dl1_datacheck h5 file
     # and the associated pdf:
-    check_dl1(filenames, args.output_dir, args.max_cores, not args.omit_pdf, args.batch)
+    check_dl1(filenames, args.output_dir, args.max_cores, not args.omit_pdf, 
+              args.batch, args.muons_dir)
 
 
 if __name__ == '__main__':

@@ -24,6 +24,7 @@ from lstchain.onsite import (
     CAT_B_PIXEL_DIR,
     create_pro_symlink,
     find_interleaved_subruns,
+    find_r0_subrun,
     find_systematics_correction_file,
     find_calibration_file,
     find_filter_wheels,
@@ -40,18 +41,15 @@ optional = parser.add_argument_group('optional arguments')
 required.add_argument('-r', '--run_number', help="Run number of interleaved data",
                       type=int, required=True)
 
-version = lstchain.__version__
-
 optional.add_argument('-c', '--catA_calibration_run',
                       help="Cat-A calibration run to be used. If None, it looks for the calibration run of the date of the interleaved data.",
                       type=int)
-optional.add_argument('-v', '--prod_version', help="Version of the production",
-                      default=f"v{version}")
+
 optional.add_argument('-s', '--statistics', help="Number of events for the flat-field and pedestal statistics",
                       type=int, default=2500)
 optional.add_argument('-b', '--base_dir', help="Root dir for the output directory tree", type=Path,
                       default=DEFAULT_BASE_PATH)
-optional.add_argument('--dl1-dir', help="Root dir for the input DL1 tree. By default, <base_dir>/DL1 will be used",
+optional.add_argument('--interleaved-dir', help="Root dir for the input interleaved files. By default, <base_dir>/DL1/date/version/interleaved will be used",
                       type=Path)
 optional.add_argument('--r0-dir', help="Root dir for the input r0 tree. By default, <base_dir>/R0 will be used",
                       type=Path)
@@ -83,12 +81,15 @@ optional.add_argument('-y', '--yes', action="store_true", help='Do not ask inter
 optional.add_argument('--no_pro_symlink', action="store_true",
                       help='Do not update the pro dir symbolic link, assume true')
 
+optional.add_argument('--cat_A_calibration_file', type=Path, help='Cat A calibration file')
+optional.add_argument('--systematics_file', type=Path, help='F-factor systematics correction file')
+
 
 def main():
     args, remaining_args = parser.parse_known_args()
     run = args.run_number
     n_subruns = args.n_subruns
-    prod_id = args.prod_version
+    prod_id = f"v{lstchain.__version__}"
     stat_events = args.statistics
     
     sys_date = args.sys_date
@@ -98,8 +99,8 @@ def main():
     yes = args.yes
     pro_symlink = not args.no_pro_symlink
     r0_dir = args.r0_dir or args.base_dir / 'R0'
-    dl1_dir = args.dl1_dir or args.base_dir / 'DL1'
-
+    catA_calibration_file = args.cat_A_calibration_file
+    systematics_file_input = args.systematics_file
 
     # looks for the filter values in the database if not given
     if args.filters is None:
@@ -118,15 +119,22 @@ def main():
 
     print(f"\n--> Config file {config_file}")
 
-   # verify input file
-    input_files = find_interleaved_subruns(run, r0_dir, dl1_dir)
-    input_path = input_files[0].parent
+    # look in R0 to find the date
+    r0_list = find_r0_subrun(run,0,r0_dir)
+    date = r0_list.parent.name
+
+    # find input path
+    ver = prod_id.rsplit(".")
+    input_path = args.interleaved_dir or args.base_dir / 'DL1'/ f"{date}/{ver[0]}.{ver[1]}/interleaved" 
+
+    # verify input file
+    input_files = find_interleaved_subruns(run, input_path)
+
     print(f"\n--> Found {len(input_files)} interleaved subruns in {input_path}")
     if n_subruns < MAX_SUBRUNS:
         print(f"--> Process {n_subruns} subruns")
 
     # verify output dir
-    date = input_files[0].parents[1].name
     calib_dir = args.base_dir / CAT_B_PIXEL_DIR
     output_dir = calib_dir / "calibration" / date / prod_id
     if not output_dir.exists():
@@ -145,14 +153,20 @@ def main():
         print(f"--> Create directory {log_dir}")
         log_dir.mkdir(parents=True, exist_ok=True)
 
-    cat_A_calib_file = find_calibration_file(pro, args.catA_calibration_run, date=date, base_dir=args.base_dir)
+    if catA_calibration_file:
+        cat_A_calib_file= catA_calibration_file
+    else:
+        cat_A_calib_file = find_calibration_file(pro, args.catA_calibration_run, date=date, base_dir=args.base_dir)
     print(f"\n--> Cat-A calibration file: {cat_A_calib_file}")
 
     # define systematic correction file
     if no_sys_correction:
         systematics_file = None
     else:
-        systematics_file = find_systematics_correction_file(pro, date, sys_date, args.base_dir)
+        if systematics_file_input:
+            systematics_file = systematics_file_input
+        else:
+            systematics_file = find_systematics_correction_file(pro, date, sys_date, args.base_dir)
 
     print(f"\n--> F-factor systematics correction file: {systematics_file}")
 

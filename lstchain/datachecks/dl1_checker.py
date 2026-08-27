@@ -31,7 +31,7 @@ from ctapipe.containers import EventType
 from ctapipe.coordinates import EngineeringCameraFrame
 from ctapipe.io import HDF5TableWriter
 from ctapipe.io import read_table
-from ctapipe_io_lst import TriggerBits, load_camera_geometry
+from ctapipe_io_lst import TriggerBits, LSTEventSource
 from ctapipe.visualization import CameraDisplay
 
 from matplotlib.backends.backend_pdf import PdfPages
@@ -50,7 +50,7 @@ from lstchain.paths import (
 )
 
 
-def check_dl1(filenames, output_path, max_cores=4, create_pdf=False, batch=False):
+def check_dl1(filenames, output_path, max_cores=4, create_pdf=False, batch=False, muons_dir=None):
     """
     Check DL1 files
 
@@ -137,6 +137,8 @@ def check_dl1(filenames, output_path, max_cores=4, create_pdf=False, batch=False
 
     # create the dl1_datacheck containers (one per subrun) for the three
     # event types, and add them to the list dl1datacheck:
+    # process_dl1_file also provides, as the 4th return, a string containing
+    # the configuration found in each DL1 file
     with Pool(max_cores) as pool:
         func_args = [(filename, histogram_binning) for
                      filename in filenames]
@@ -175,17 +177,27 @@ def check_dl1(filenames, output_path, max_cores=4, create_pdf=False, batch=False
     file = h5py.File(datacheck_filename, mode='a')
     file.create_dataset('/dl1datacheck/used_trigger_tag', (1,), 'S32',
                         [trigger_source.encode('ascii')])
+    # Write the configuration:
+    cosmics_table = file.get('/dl1datacheck/cosmics')
+    if cosmics_table is not None:
+        # We take the configuration of the first of the DL1 files (if more than
+        # one was processed), assuming the analysis was homogeneous!
+        cosmics_table.attrs['config'] = dl1datacheck[0][3]
+    
     file.close()
 
-    # do the plots and save them to a pdf file. We will look for the muons fits
-    # files in the same directory as the DL1 files (assuming all of them are
-    # in the same directory as the first one!)
+    # do the plots and save them to a pdf file
     if create_pdf:
+        if muons_dir is None:
+            # if not provided, assume muons .fits files are in the 
+            # same directory as the DL1 files:
+            muons_dir = os.path.dirname(filenames[0])
+        
         plot_datacheck(
             datacheck_filename,
             output_path,
             batch,
-            muons_dir=os.path.dirname(filenames[0]),
+            muons_dir=muons_dir,
             tel_id=first_file.tel_id
         )
 
@@ -213,6 +225,9 @@ def process_dl1_file(filename, bins, tel_id=1):
     If one or more of them is None, it means they have not been filled,
     due to lack of events if the given type in the input DL1 file.
 
+    configuration: string containing the configuration stored in the attrs of 
+    the input dl1 table (settings used in the analysis) 
+
     """
 
     logger = logging.getLogger(__name__)
@@ -228,12 +243,17 @@ def process_dl1_file(filename, bins, tel_id=1):
     #geom = subarray_info.tel[tel_id].camera.geometry
     #equivalent_focal_length = subarray_info.tel[tel_id].optics.equivalent_focal_length
 
-    geom = load_camera_geometry()
-    equivalent_focal_length = geom.frame.focal_length
+    sa = LSTEventSource.create_subarray(tel_id=1)
+    geom = sa.tel[1].camera.geometry
+    equivalent_focal_length = sa.tel[1].optics.equivalent_focal_length
+    effective_focal_length = sa.tel[1].optics.effective_focal_length
 
+    # Note: the transformation from m to degrees below does not correct for
+    # aberration:
     m2deg = np.rad2deg(u.m / equivalent_focal_length * u.rad) / u.m
 
     parameters = read_table(filename, dl1_params_lstcam_key)
+    configuration = parameters.meta['config']
 
     # convert cog distance to camera center from meters to degrees:
     parameters['r'] = parameters['r'].quantity * m2deg
@@ -249,12 +269,12 @@ def process_dl1_file(filename, bins, tel_id=1):
     # The same mask should be valid for image_table, since the entry in
     # the two tables correspond one to one.
 
-    # Revise flatfield_mask : event_type can be rarely wrong, so check
-    # here that all events look like interleaved flat field events:
-    # Note (AM, 20211202): finally we won't use this, the event source
-    # takes care of it
-    # flatfield_mask &= ((parameters['intensity'] > 50000) &
-    #                    (parameters['concentration_pixel'] < 0.005))
+    # Revise flatfield_mask : event_type can be (rarely) wrong, so we make
+    # sure here that all events look like interleaved flat field events:
+    # (Note: this would fail if ever we move to using significantly dimmer
+    # flat-field flashes - as of 2025/07 we have ~72 p.e./pixel)
+    flatfield_mask &= ((parameters['intensity'] > 50000) &
+                       (parameters['concentration_pixel'] < 0.005))
 
     pedestal_mask = (parameters['event_type'] ==
                      EventType.SKY_PEDESTAL.value)
@@ -278,7 +298,7 @@ def process_dl1_file(filename, bins, tel_id=1):
                                                     geom, bins)
         dl1datacheck_pedestals.fill_pixel_wise_info(image_table,
                                                     pedestal_mask, bins,
-                                                    equivalent_focal_length,
+                                                    effective_focal_length,
                                                     geom,
                                                     'pedestals')
     else:
@@ -291,7 +311,7 @@ def process_dl1_file(filename, bins, tel_id=1):
                                                     geom, bins)
         dl1datacheck_flatfield.fill_pixel_wise_info(image_table,
                                                     flatfield_mask, bins,
-                                                    equivalent_focal_length,
+                                                    effective_focal_length,
                                                     geom,
                                                     'flatfield')
     else:
@@ -304,14 +324,14 @@ def process_dl1_file(filename, bins, tel_id=1):
                                                   geom, bins)
         dl1datacheck_cosmics.fill_pixel_wise_info(image_table,
                                                   cosmics_mask, bins,
-                                                  equivalent_focal_length,
+                                                  effective_focal_length,
                                                   geom,
                                                   'cosmics')
     else:
         dl1datacheck_cosmics = None
 
     return dl1datacheck_pedestals, dl1datacheck_flatfield, \
-           dl1datacheck_cosmics
+           dl1datacheck_cosmics, configuration
 
 
 def plot_datacheck(datacheck_filename, out_path=None, batch=False,
@@ -365,14 +385,14 @@ def plot_datacheck(datacheck_filename, out_path=None, batch=False,
         pdf_filename = Path(out_path, pdf_filename.name)
 
     # Read camera geometry
-    # subarray_info = SubarrayDescription.from_hdf(datacheck_filename)
-    # geom = subarray_info.tel[tel_id].camera.geometry
-    geom = load_camera_geometry()
+    sa = LSTEventSource.create_subarray(tel_id=1)
+    geom = sa.tel[1].camera.geometry
+
     engineering_geom = geom.transform_to(EngineeringCameraFrame())
 
     # For future bokeh-based display, turned off for now:
-    # page1 = Panel()
-    # page2 = Panel()
+    # page1 = TabPanel()
+    # page2 = TabPanel()
 
     with PdfPages(pdf_filename) as pdf:
         # first deal with the DL1 datacheck file, created from DL1 event data:
@@ -407,7 +427,7 @@ def plot_datacheck(datacheck_filename, out_path=None, batch=False,
             raise RuntimeError
 
         dl1dcheck_tables = [table_flatfield, table_pedestals, table_cosmics]
-        labels = ['flatfield (guessed)', 'pedestals',
+        labels = ['flatfield', 'pedestals',
                   'cosmics']
         labels = [x for i, x in enumerate(labels)
                   if dl1dcheck_tables[i] is not None]
@@ -557,9 +577,13 @@ def plot_datacheck(datacheck_filename, out_path=None, batch=False,
             bins = hist_binning.col(hist)[0]
             for table in dl1dcheck_tables:
                 contents = np.sum(table.col(hist), axis=0)
+                if contents.sum() > 0:
+                    ww = contents / contents.sum()
+                else:
+                    ww = np.zeros_like(contents)
+                    # need to plot it even if empty to keep meaning of colors!
                 axes.flatten()[i].hist(bins[:-1], bins, histtype='step',
-                                       weights=contents / contents.sum(),
-                                       label=table.name)
+                                       weights=ww, label=table.name)
             axes.flatten()[i].set_yscale('log')
             axes.flatten()[i].set_xscale('log')
             axes.flatten()[i].set_ylabel('fraction of events of the given type')

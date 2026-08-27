@@ -27,7 +27,8 @@ from ctapipe.image import (
     apply_time_delta_cleaning,
 )
 from ctapipe.instrument import SubarrayDescription
-from ctapipe_io_lst import constants
+from ctapipe_io_lst import constants, LSTEventSource
+
 
 from lstchain.calib.camera.pixel_threshold_estimation import get_threshold_from_dl1_file
 from lstchain.image.cleaning import apply_dynamic_cleaning
@@ -122,7 +123,7 @@ def main():
             log.critical(f"Calibration file {args.catB_calibration_file} not found")
             sys.exit(1)
 
-        log.info(f"Cat-B calbration file: {args.catB_calibration_file}")
+        log.info(f"Cat-B calibration file: {args.catB_calibration_file}")
         catB_calib = read_table(args.catB_calibration_file, "/tel_1/calibration")
 
         # add the calibration index
@@ -182,21 +183,21 @@ def main():
         log.info("Pedestal cleaning")
         clean_method_name = 'tailcuts_clean_with_pedestal_threshold'
         sigma = config[clean_method_name]['sigma']
-        pedestal_thresh = get_threshold_from_dl1_file(args.input_file, sigma)
         cleaning_params = get_cleaning_parameters(config, clean_method_name)
         pic_th, boundary_th, isolated_pixels, min_n_neighbors = cleaning_params
-        log.info(f"Fraction of Cat_A pixel cleaning thresholds above Cat_A picture thr.:"
-                 f"{np.sum(pedestal_thresh > pic_th) / len(pedestal_thresh):.3f}")
-        picture_th = np.clip(pedestal_thresh, pic_th, None)
-        log.info(f"Tailcut clean with pedestal threshold config used:"
-                 f"{config['tailcuts_clean_with_pedestal_threshold']}")
-        
-        if args.catB_calibration_file is not None:
+
+        if catB_calib:
             catB_pedestal_mean = np.array(catB_pedestal["charge_mean"])
-            catB_pedestal_std= np.array(catB_pedestal["charge_std"])
+            catB_pedestal_std = np.array(catB_pedestal["charge_std"])
             catB_threshold_clean_pe = catB_pedestal_mean + sigma * catB_pedestal_std
-
-
+        else:
+            pedestal_thresh = get_threshold_from_dl1_file(args.input_file, sigma)
+            log.info(
+                f"Fraction of Cat_A pixel cleaning thresholds above Cat_A picture thr.:"
+                f"{np.sum(pedestal_thresh > pic_th) / len(pedestal_thresh):.3f}")
+            picture_th = np.clip(pedestal_thresh, pic_th, None)
+            log.info(f"Tailcut clean with pedestal threshold config used:"
+                     f"{config['tailcuts_clean_with_pedestal_threshold']}")
     else:
         clean_method_name = 'tailcut'
         cleaning_params = get_cleaning_parameters(config, clean_method_name)
@@ -223,8 +224,16 @@ def main():
     if "delta_time" in config[clean_method_name]:
         delta_time = config[clean_method_name]["delta_time"]
 
-    subarray_info = SubarrayDescription.from_hdf(args.input_file)
     tel_id = config["allowed_tels"][0] if "allowed_tels" in config else 1
+    replace_subarray_info = False
+    try:
+        subarray_info = SubarrayDescription.from_hdf(args.input_file)
+    except OSError:
+        log.warning("Subarray description table is not readable because of version incompatibility.")
+        log.warning("The standard LST optics and camera geometry will be used.")
+        replace_subarray_info = True
+        subarray_info = LSTEventSource.create_subarray(tel_id=tel_id)
+
     optics = subarray_info.tel[tel_id].optics
     camera_geom = subarray_info.tel[tel_id].camera.geometry
 
@@ -260,8 +269,11 @@ def main():
         parameters_to_update["calibration_id"] = np.int32
 
     nodes_keys = get_dataset_keys(args.input_file)
-    if args.no_image:
-        nodes_keys.remove(dl1_images_lstcam_key)
+    # Remove the images key from the list of nodes to be copied: 
+    # it will be added later if so chosen by the user.
+    # Copying it here sometimes resulted in too bulky files, due
+    # to empty chunks.
+    nodes_keys.remove(dl1_images_lstcam_key)
 
     metadata = global_metadata()
 
@@ -308,6 +320,10 @@ def main():
 
         with tables.open_file(args.output_file, mode='a', filters=HDF5_ZSTD_FILTERS) as outfile:
             copy_h5_nodes(infile, outfile, nodes=nodes_keys)
+            if replace_subarray_info:
+                outfile.remove_node("/configuration/instrument", recursive=True)
+                subarray_info.to_hdf(outfile)
+
             add_source_filenames(outfile, [args.input_file])
 
             # need container to use lstchain.io.add_global_metadata and lstchain.io.add_config_metadata
@@ -352,10 +368,11 @@ def main():
                     image_table['image'][ii] = image
                     image_table['peak_time'][ii] = peak_time
 
-                    # use CatB pedestals to estimate the picture threshold 
-                    # as defined in the config file
                     if args.pedestal_cleaning:
-                        threshold_clean_pe = catB_threshold_clean_pe[calib_idx][selected_gain, pixel_index]
+                        # use CatB pedestals to estimate the picture threshold
+                        # as defined in the config file
+                        threshold_clean_pe = (catB_dc_to_pe[calib_idx][0, pixel_index] *
+                                              catB_threshold_clean_pe[calib_idx][0, pixel_index])
                         threshold_clean_pe[unusable_pixels] = pic_th
                         picture_th = np.clip(threshold_clean_pe, pic_th, None)
 
@@ -390,13 +407,9 @@ def main():
                     # if delta_time has been set, we require at least one
                     # neighbor within delta_time to accept a pixel in the image:
                     if delta_time is not None:
-                        cleaned_pixel_times = peak_time
-                        # makes sure only signal pixels are used in the time
-                        # check:
-                        cleaned_pixel_times[~signal_pixels] = np.nan
                         new_mask = apply_time_delta_cleaning(camera_geom,
                                                              signal_pixels,
-                                                             cleaned_pixel_times,
+                                                             peak_time,
                                                              1,
                                                              delta_time)
                         signal_pixels = new_mask
@@ -452,7 +465,10 @@ def main():
                 dl1_container['sin_az_tel'] = np.sin(params['az_tel'][ii])
 
                 for p in parameters_to_update:
-                    params[ii][p] = u.Quantity(dl1_container[p]).value
+                    if np.isscalar(dl1_container[p]):
+                        params[ii][p] = dl1_container[p]
+                    else:
+                        params[ii][p] = dl1_container[p].value
 
                 images[ii] = image
 
@@ -465,6 +481,11 @@ def main():
                 write_table(image_table, outfile, dl1_images_lstcam_key, overwrite=True, filters=HDF5_ZSTD_FILTERS)
 
             add_config_metadata(params, config)
+            # Make sure we have the right units in all columns which have them
+            # (this is needed to process DL1 files produced with v0.9!):
+            for p in params.columns:
+                params[p].unit = dl1_container.fields[p].unit
+
             write_table(params, outfile, dl1_params_lstcam_key, overwrite=True, filters=HDF5_ZSTD_FILTERS)
 
             # write a cat-B calibrations in DL1b
