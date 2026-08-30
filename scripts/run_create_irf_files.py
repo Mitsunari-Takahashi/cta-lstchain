@@ -159,6 +159,8 @@ def list_node_files(dec_dir):
     files = sorted(dec_dir.glob(NODE_FILE_GLOB))
     if not files:
         log.warning("No MC files found under %s (pattern: %s)", dec_dir, NODE_FILE_GLOB)
+    else:
+        log.info("Found %d MC file(s) under %s", len(files), dec_dir)
     return files
 
 
@@ -404,6 +406,17 @@ def main():
     plots_root = args.output_dir / PLOTS_SUBDIR
     fits_root.mkdir(parents=True, exist_ok=True)
 
+    log.info(
+        "Run configuration: target='%s' (dec=%.4f deg), config=%s, "
+        "mc_base_dir=%s, mc_tag=%s, dataset=%s, particle=%s, nsb=%s, "
+        "energy_dependent_gh=%s, overwrite=%s, srun=%s",
+        args.target, target_dec, args.config,
+        args.mc_base_dir, args.mc_tag, args.dataset, args.particle, args.nsb_values,
+        args.energy_dependent_gh, args.overwrite, args.srun,
+    )
+    log.info("IRF FITS files will be written under: %s", fits_root)
+    log.info("Diagnostic plots will be written under: %s", plots_root)
+
     created_irf_files = []
     for nsb_val in args.nsb_values:
         particle_dir = (
@@ -412,7 +425,12 @@ def main():
             / args.dataset
             / args.particle
         )
+        log.info("NSB=%.2f: scanning MC directory %s", nsb_val, particle_dir)
         dec_dirs = find_dec_dirs(particle_dir)
+        log.info(
+            "NSB=%.2f: available dec nodes: %s",
+            nsb_val, {round(d, 3): dec_dirs[d].name for d in sorted(dec_dirs)},
+        )
         selected_decs = select_bracketing_decs(dec_dirs, target_dec)
         log.info(
             "NSB=%.2f: bracketing dec nodes for target dec=%.3f deg: %s",
@@ -428,20 +446,27 @@ def main():
                     args.mc_tag, nsb_val, dec_dir.name, infile
                 )
                 outfile = fits_root / rel_path
+                log.info("Input DL2 MC gamma file: %s", infile)
+                log.info("Output IRF FITS file: %s", outfile)
                 run_lstchain_create_irf_files(infile, outfile, args)
                 if args.dry_run:
                     continue
                 if outfile.exists():
+                    log.info("Created IRF FITS file: %s", outfile)
                     created_irf_files.append((outfile, plots_root / rel_path.parent))
                 else:
                     log.error("Expected output file was not created: %s", outfile)
 
+    created_pngs = []
     if not args.skip_plots and not args.dry_run:
         for irf_file, plot_dir in created_irf_files:
             log.info("Creating diagnostic plots for %s in %s", irf_file, plot_dir)
-            make_diagnostic_plots(irf_file, plot_dir, args.energy_dependent_gh)
+            created_pngs += make_diagnostic_plots(irf_file, plot_dir, args.energy_dependent_gh)
 
-    log.info("Done. Created %d IRF file(s).", len(created_irf_files))
+    log.info(
+        "Done. Created %d IRF FITS file(s) and %d diagnostic PNG file(s).",
+        len(created_irf_files), len(created_pngs),
+    )
 
 
 if __name__ == "__main__":
