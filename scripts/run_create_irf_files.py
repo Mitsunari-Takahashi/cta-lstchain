@@ -31,9 +31,13 @@ For each selected input DL2 gamma file, an IRF FITS file is created with:
         [--energy-dependent-gh] [--overwrite] ...
 
 The diagnostic PNG plots for each IRF file are written under the same
-relative path, but under a sibling "plots" directory instead of "fits":
+relative path, but under a sibling "plots" directory instead of "fits", one
+PNG per IRF component (effective area, energy dispersion & bias,
+gamma/hadron cut, PSF):
 
-    <output-dir>/plots/<mc-tag>_nsb_<NSB>/<dec-dir>/irfs_theta_..._az_..._irf_diagnostics.png
+    <output-dir>/plots/<mc-tag>_nsb_<NSB>/<dec-dir>/irfs_theta_..._az_..._aeff.png
+    <output-dir>/plots/<mc-tag>_nsb_<NSB>/<dec-dir>/irfs_theta_..._az_..._edisp.png
+    <output-dir>/plots/<mc-tag>_nsb_<NSB>/<dec-dir>/irfs_theta_..._az_..._gh_cut.png
     <output-dir>/plots/<mc-tag>_nsb_<NSB>/<dec-dir>/irfs_theta_..._az_..._psf.png
 
 Example
@@ -208,11 +212,14 @@ def run_lstchain_create_irf_files(infile, outfile, args):
 def make_diagnostic_plots(irf_file, plot_dir, energy_dependent_gh):
     """Create PNG plots summarizing the contents of one IRF FITS file.
 
-    Two files are written under ``plot_dir``:
-    ``<name>_irf_diagnostics.png`` (effective area, energy dispersion bias,
-    gamma/hadron cut) and ``<name>_psf.png`` (point spread function).
-    Creation time and this script's path are embedded as PNG metadata.
-    Returns the list of PNG paths that were created.
+    Up to four files are written under ``plot_dir``, one per IRF component:
+    ``<name>_aeff.png`` (effective area), ``<name>_edisp.png`` (energy
+    dispersion and bias), ``<name>_gh_cut.png`` (gamma/hadron cut, only if
+    ``energy_dependent_gh`` and a GH_CUTS HDU is present), and
+    ``<name>_psf.png`` (point spread function). Creation time and this
+    script's path are embedded as PNG metadata. Returns the list of PNG
+    paths that were created; a failure on one plot does not prevent the
+    others from being attempted.
     """
     # Imported lazily so that --skip-plots does not require gammapy/matplotlib.
     import matplotlib
@@ -236,68 +243,78 @@ def make_diagnostic_plots(irf_file, plot_dir, energy_dependent_gh):
 
     plot_dir.mkdir(parents=True, exist_ok=True)
 
-    created = []
-    try:
-        aeff = EffectiveAreaTable2D.read(irf_file, hdu="EFFECTIVE AREA")
-        edisp = EnergyDispersion2D.read(irf_file, hdu="ENERGY DISPERSION")
-
-        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-
-        aeff.plot(ax=axes[0, 0])
-        axes[0, 0].set_title("Effective Area (energy-offset dependence)")
-
-        aeff.plot_energy_dependence(ax=axes[0, 1], offset=[0.5 * u.deg])
-        legend = axes[0, 1].get_legend()
-        if legend is not None:
-            legend.remove()
-        axes[0, 1].set_yscale("log")
-        axes[0, 1].grid(which="both", linestyle=":")
-        axes[0, 1].set_xlim(0.01, 200)
-        axes[0, 1].set_title("Effective Area (energy dependence, offset=0.5 deg)")
-
-        edisp.plot_bias(ax=axes[1, 0], offset=[0.4 * u.deg], add_cbar=True)
-        axes[1, 0].set_title("Energy Bias (offset=0.4 deg)")
-
-        if energy_dependent_gh:
-            try:
-                gh_cut = QTable.read(irf_file, hdu="GH_CUTS")
-                axes[1, 1].errorbar(
-                    gh_cut["center"], gh_cut["cut"],
-                    xerr=(
-                        gh_cut["center"] - gh_cut["low"],
-                        gh_cut["high"] - gh_cut["center"],
-                    ),
-                )
-                axes[1, 1].set_xscale("log")
-                axes[1, 1].set_title(r"$\gamma$/h cut")
-                axes[1, 1].set_ylabel(r"$\gamma$/h cut")
-                axes[1, 1].set_xlabel("Energy [TeV]")
-                axes[1, 1].grid(which="both")
-            except KeyError:
-                axes[1, 1].axis("off")
-        else:
-            axes[1, 1].axis("off")
-
+    def save(fig, suffix):
         fig.suptitle(irf_file.name)
         fig.tight_layout()
-
-        diagnostics_png = plot_dir / f"{base_name}_irf_diagnostics.png"
-        fig.savefig(diagnostics_png, dpi=150, metadata=metadata)
+        png_path = plot_dir / f"{base_name}_{suffix}.png"
+        fig.savefig(png_path, dpi=150, metadata=metadata)
         plt.close(fig)
-        created.append(diagnostics_png)
-        log.info("Wrote %s", diagnostics_png)
+        log.info("Wrote %s", png_path)
+        return png_path
 
+    created = []
+
+    # Effective Area: energy-offset dependence, energy dependence, offset dependence.
+    try:
+        aeff = EffectiveAreaTable2D.read(irf_file, hdu="EFFECTIVE AREA")
+        fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+
+        aeff.plot(ax=axes[0])
+        axes[0].set_title("Energy-offset dependence")
+
+        aeff.plot_energy_dependence(ax=axes[1], offset=[0.5 * u.deg])
+        legend = axes[1].get_legend()
+        if legend is not None:
+            legend.remove()
+        axes[1].set_yscale("log")
+        axes[1].grid(which="both", linestyle=":")
+        axes[1].set_xlim(0.01, 200)
+        axes[1].set_title("Energy dependence (offset=0.5 deg)")
+
+        aeff.plot_offset_dependence(ax=axes[2])
+        axes[2].set_title("Offset dependence")
+
+        created.append(save(fig, "aeff"))
+    except Exception:
+        log.exception("Failed to create effective area plot for %s", irf_file)
+
+    # Energy Dispersion and Bias: gammapy's built-in 3-panel summary
+    # (bias, migration distribution, dispersion matrix).
+    try:
+        edisp = EnergyDispersion2D.read(irf_file, hdu="ENERGY DISPERSION")
+        edisp.peek()
+        created.append(save(plt.gcf(), "edisp"))
+    except Exception:
+        log.exception("Failed to create energy dispersion plot for %s", irf_file)
+
+    # Gamma/hadron cut: only meaningful for energy-dependent-gh IRFs.
+    if energy_dependent_gh:
+        try:
+            gh_cut = QTable.read(irf_file, hdu="GH_CUTS")
+            fig, ax = plt.subplots(figsize=(8, 6))
+            ax.errorbar(
+                gh_cut["center"], gh_cut["cut"],
+                xerr=(
+                    gh_cut["center"] - gh_cut["low"],
+                    gh_cut["high"] - gh_cut["center"],
+                ),
+            )
+            ax.set_xscale("log")
+            ax.set_title(r"$\gamma$/h cut")
+            ax.set_ylabel(r"$\gamma$/h cut")
+            ax.set_xlabel("Energy [TeV]")
+            ax.grid(which="both")
+            created.append(save(fig, "gh_cut"))
+        except Exception:
+            log.exception("Failed to create gamma/hadron cut plot for %s", irf_file)
+
+    # Point Spread Function: gammapy's built-in summary plot.
+    try:
         psf = PSF3D.read(irf_file, hdu="PSF")
         psf.peek()
-        psf_fig = plt.gcf()
-        psf_fig.suptitle(irf_file.name)
-        psf_png = plot_dir / f"{base_name}_psf.png"
-        psf_fig.savefig(psf_png, dpi=150, metadata=metadata)
-        plt.close(psf_fig)
-        created.append(psf_png)
-        log.info("Wrote %s", psf_png)
+        created.append(save(plt.gcf(), "psf"))
     except Exception:
-        log.exception("Failed to create diagnostic plots for %s", irf_file)
+        log.exception("Failed to create PSF plot for %s", irf_file)
 
     return created
 
