@@ -43,10 +43,11 @@ gamma/hadron cut, PSF):
 With --sbatch, each IRF creation is instead submitted as its own SLURM batch
 job (via a generated script under <output-dir>/job_scripts/ and `sbatch`),
 so that files are processed in parallel across the cluster instead of one
-at a time. Since the jobs run asynchronously, diagnostic plots are only
-generated (immediately) for outputs that already existed before this run;
-plots for newly submitted jobs must be created by re-running this script
-(with --skip-plots off) once the jobs have finished.
+at a time. Each job is self-contained: unless --skip-plots is given, it
+also generates its own diagnostic plots right after creating its IRF file,
+by re-invoking this script in --plot-only mode. (Outputs that already
+existed before this run, and were therefore not resubmitted, are instead
+plotted immediately by this script itself.)
 
 Example
 -------
@@ -233,10 +234,16 @@ def run_lstchain_create_irf_files(infile, outfile, args):
     subprocess.run(cmd, check=True)
 
 
-def submit_lstchain_create_irf_files_job(infile, outfile, job_scripts_dir, args, job_tag):
+def submit_lstchain_create_irf_files_job(infile, outfile, plot_dir, job_scripts_dir, args, job_tag):
     """Write a SLURM batch script running lstchain_create_irf_files for one
     input DL2 MC gamma file, and submit it with sbatch, so that many files
     can be processed in parallel across the cluster instead of one at a time.
+
+    Unless ``args.skip_plots`` is set, the job script also generates that
+    file's diagnostic plots (into ``plot_dir``) right after creating it, by
+    re-invoking this same script in --plot-only mode -- so each job is fully
+    self-contained (one IRF file in, its FITS file and PNGs out) and no
+    separate plotting pass is needed once the jobs finish.
 
     ``job_tag`` must be unique across the whole run (e.g. combining NSB,
     declination node and pointing angle) since it is used both as the SLURM
@@ -265,13 +272,27 @@ def submit_lstchain_create_irf_files_job(infile, outfile, job_scripts_dir, args,
         script_lines.append("#SBATCH --exclusive")
     script_lines += [
         "",
+        # Stop after the IRF creation step fails, so a broken/missing FITS
+        # file is never handed to the plotting step below.
+        "set -e",
+        "",
         "ulimit -l unlimited",
         "ulimit -s unlimited",
         "ulimit -a",
         "",
         " ".join(cmd),
-        "",
     ]
+    if not args.skip_plots:
+        plot_dir.mkdir(parents=True, exist_ok=True)
+        plot_cmd = [
+            sys.executable, str(SCRIPT_PATH),
+            "--plot-only-file", str(outfile),
+            "--plot-only-dir", str(plot_dir),
+        ]
+        if not args.energy_dependent_gh:
+            plot_cmd.append("--no-energy-dependent-gh")
+        script_lines.append(" ".join(plot_cmd))
+    script_lines.append("")
 
     job_script_path = job_scripts_dir / f"{job_name}.sh"
     job_script_path.write_text("\n".join(script_lines))
@@ -411,17 +432,19 @@ def build_arg_parser():
         ),
     )
     parser.add_argument(
-        "--config", required=True, type=Path,
+        "--config", type=Path,
         help="Path to the lstchain_create_irf_files JSON config file "
-             "(passed through as --config)",
+             "(passed through as --config). Required unless --plot-only-file is used.",
     )
     parser.add_argument(
-        "--target", required=True,
-        help='Target name resolved with astropy SkyCoord.from_name, e.g. "Crab Nebula"',
+        "--target",
+        help='Target name resolved with astropy SkyCoord.from_name, e.g. "Crab Nebula". '
+             "Required unless --plot-only-file is used.",
     )
     parser.add_argument(
-        "--nsb", dest="nsb_values", required=True, type=float, nargs="+",
-        help="One or more NSB values, e.g. --nsb 0.14 0.22 0.38 0.50",
+        "--nsb", dest="nsb_values", type=float, nargs="+",
+        help="One or more NSB values, e.g. --nsb 0.14 0.22 0.38 0.50. "
+             "Required unless --plot-only-file is used.",
     )
     parser.add_argument(
         "--mc-tag", default="20250212_v0.10.17_allsky_interp_dl2_irfs",
@@ -441,10 +464,24 @@ def build_arg_parser():
         help="Particle subdirectory name under the dataset directory (default: %(default)s)",
     )
     parser.add_argument(
-        "--output-dir", required=True, type=Path,
+        "--output-dir", type=Path,
         help="Base output directory. IRF FITS files are written under "
              f"<output-dir>/{FITS_SUBDIR}/... and diagnostic plots under "
-             f"<output-dir>/{PLOTS_SUBDIR}/..., mirroring the same subdirectory layout",
+             f"<output-dir>/{PLOTS_SUBDIR}/..., mirroring the same subdirectory layout. "
+             "Required unless --plot-only-file is used.",
+    )
+    parser.add_argument(
+        "--plot-only-file", type=Path, default=None,
+        help="Internal use: skip IRF creation entirely and just generate diagnostic "
+             "plots (into --plot-only-dir) for this single, already-existing IRF FITS "
+             "file, then exit. This is what --sbatch job scripts call on themselves "
+             "after creating their IRF file; you normally don't need to pass this by "
+             "hand, but it can also be used to (re)plot one file on its own.",
+    )
+    parser.add_argument(
+        "--plot-only-dir", type=Path, default=None,
+        help="Directory to write the PNGs into when --plot-only-file is used "
+             "(required together with it).",
     )
     parser.add_argument(
         "--input-proton-dl2", type=Path, default=None,
@@ -472,9 +509,9 @@ def build_arg_parser():
         help="Submit each IRF creation as its own SLURM batch job (via sbatch) instead "
              "of running lstchain_create_irf_files directly, so files are processed in "
              "parallel across the cluster. Job scripts are written under "
-             f"<output-dir>/{JOB_SCRIPTS_SUBDIR}/. Diagnostic plots are skipped for "
-             "jobs submitted this way (see --skip-plots); the script does not wait "
-             "for the jobs to finish.",
+             f"<output-dir>/{JOB_SCRIPTS_SUBDIR}/; each job also generates its own "
+             "diagnostic plots right after creating its IRF file (unless --skip-plots "
+             "is given). The script does not wait for the jobs to finish.",
     )
     parser.add_argument(
         "--sbatch-partition", default="short",
@@ -511,12 +548,25 @@ def build_arg_parser():
 
 
 def main():
-    args = build_arg_parser().parse_args()
+    parser = build_arg_parser()
+    args = parser.parse_args()
     logging.basicConfig(
         level=getattr(logging, args.log_level),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
         stream=sys.stdout,
     )
+
+    if args.plot_only_file is not None or args.plot_only_dir is not None:
+        if args.plot_only_file is None or args.plot_only_dir is None:
+            parser.error("--plot-only-file and --plot-only-dir must be given together")
+        created = make_diagnostic_plots(
+            args.plot_only_file, args.plot_only_dir, args.energy_dependent_gh
+        )
+        log.info("Done. Created %d diagnostic PNG file(s).", len(created))
+        return
+
+    if args.config is None or args.target is None or not args.nsb_values or args.output_dir is None:
+        parser.error("--config, --target, --nsb and --output-dir are required")
 
     if not args.config.is_file() and not args.dry_run:
         log.error("Config file not found: %s", args.config)
@@ -579,14 +629,15 @@ def main():
                 log.info("Output IRF FITS file: %s", outfile)
 
                 if args.sbatch:
+                    plot_dir = plots_root / rel_path.parent
                     if outfile.exists() and not args.overwrite:
                         log.info("Output file already exists: %s. Skipping.", outfile)
                         n_skipped_existing += 1
-                        created_irf_files.append((outfile, plots_root / rel_path.parent))
+                        created_irf_files.append((outfile, plot_dir))
                         continue
                     job_tag = f"nsb{nsb_val:.2f}_{dec_dir.name}_{outfile.stem}"
                     if submit_lstchain_create_irf_files_job(
-                        infile, outfile, job_scripts_dir, args, job_tag
+                        infile, outfile, plot_dir, job_scripts_dir, args, job_tag
                     ):
                         n_submitted += 1
                     continue
@@ -601,12 +652,15 @@ def main():
                     log.error("Expected output file was not created: %s", outfile)
 
     if args.sbatch and not args.dry_run:
+        plot_note = (
+            "each job will also generate its own diagnostic plots after creating "
+            "its IRF file" if not args.skip_plots else
+            "diagnostic plots were not requested (--skip-plots)"
+        )
         log.info(
             "Submitted %d sbatch job(s) (%d output file(s) already existed and were "
-            "skipped). Jobs run asynchronously; re-run this script (without --sbatch, "
-            "and without --skip-plots) once they finish to generate diagnostic plots "
-            "for the newly created files.",
-            n_submitted, n_skipped_existing,
+            "skipped). Jobs run asynchronously; %s.",
+            n_submitted, n_skipped_existing, plot_note,
         )
 
     created_pngs = []
