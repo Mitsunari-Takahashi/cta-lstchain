@@ -363,6 +363,7 @@ def make_diagnostic_plots(irf_file, plot_dir, energy_dependent_gh):
         fig, axes = plt.subplots(1, 3, figsize=(18, 5))
 
         aeff.plot(ax=axes[0])
+        axes[0].set_zscale('log')
         axes[0].set_title("Energy-offset dependence")
 
         aeff.plot_energy_dependence(ax=axes[1], offset=[0.5 * u.deg])
