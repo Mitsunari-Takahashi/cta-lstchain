@@ -40,6 +40,14 @@ gamma/hadron cut, PSF):
     <output-dir>/plots/<mc-tag>_nsb_<NSB>/<dec-dir>/irfs_theta_..._az_..._gh_cut.png
     <output-dir>/plots/<mc-tag>_nsb_<NSB>/<dec-dir>/irfs_theta_..._az_..._psf.png
 
+With --sbatch, each IRF creation is instead submitted as its own SLURM batch
+job (via a generated script under <output-dir>/job_scripts/ and `sbatch`),
+so that files are processed in parallel across the cluster instead of one
+at a time. Since the jobs run asynchronously, diagnostic plots are only
+generated (immediately) for outputs that already existed before this run;
+plots for newly submitted jobs must be created by re-running this script
+(with --skip-plots off) once the jobs have finished.
+
 Example
 -------
 run_create_irf_files.py \\
@@ -65,9 +73,15 @@ log = logging.getLogger(__name__)
 SCRIPT_PATH = Path(__file__).resolve()
 
 # Top-level subdirectories of --output-dir holding, respectively, the IRF
-# FITS files and their diagnostic PNG plots (mirrored directory structure).
+# FITS files, their diagnostic PNG plots (mirrored directory structure), and
+# the SLURM batch scripts generated when --sbatch is used.
 FITS_SUBDIR = "fits"
 PLOTS_SUBDIR = "plots"
+JOB_SCRIPTS_SUBDIR = "job_scripts"
+
+# Characters allowed unescaped in a SLURM job name; anything else is replaced
+# with "_" (job names are also used as the batch script's file name).
+_JOB_TAG_RE = re.compile(r"[^A-Za-z0-9_.-]")
 
 # Matches AllSky MC declination-node directory names, e.g. "dec_2276" (+22.76
 # deg) or "dec_min_2276" (-22.76 deg).
@@ -180,14 +194,11 @@ def build_relative_output_path(mc_tag, nsb_val, dec_dir_name, infile):
     return Path(f"{mc_tag}_nsb_{nsb_val:.2f}") / dec_dir_name / outname
 
 
-def run_lstchain_create_irf_files(infile, outfile, args):
-    """Run lstchain_create_irf_files for one input DL2 MC gamma file."""
-    outfile.parent.mkdir(parents=True, exist_ok=True)
-
-    cmd = []
-    if args.srun:
-        cmd.append("srun")
-    cmd += [
+def build_irf_command(infile, outfile, args):
+    """Build the lstchain_create_irf_files command line (as a list of tokens,
+    without any 'srun'/'sbatch' wrapper) for one input DL2 MC gamma file.
+    """
+    cmd = [
         "lstchain_create_irf_files",
         "--input-gamma-dl2", str(infile),
         "--output-irf-file", str(outfile),
@@ -202,11 +213,82 @@ def run_lstchain_create_irf_files(infile, outfile, args):
     if args.overwrite:
         cmd.append("--overwrite")
     cmd += args.extra_args
+    return cmd
+
+
+def run_lstchain_create_irf_files(infile, outfile, args):
+    """Run lstchain_create_irf_files directly (blocking) for one input DL2
+    MC gamma file. Files are processed one at a time; see
+    submit_lstchain_create_irf_files_job (--sbatch) for parallel processing.
+    """
+    outfile.parent.mkdir(parents=True, exist_ok=True)
+
+    cmd = build_irf_command(infile, outfile, args)
+    if args.srun:
+        cmd = ["srun"] + cmd
 
     log.info("Running: %s", " ".join(cmd))
     if args.dry_run:
         return
     subprocess.run(cmd, check=True)
+
+
+def submit_lstchain_create_irf_files_job(infile, outfile, job_scripts_dir, args, job_tag):
+    """Write a SLURM batch script running lstchain_create_irf_files for one
+    input DL2 MC gamma file, and submit it with sbatch, so that many files
+    can be processed in parallel across the cluster instead of one at a time.
+
+    ``job_tag`` must be unique across the whole run (e.g. combining NSB,
+    declination node and pointing angle) since it is used both as the SLURM
+    job name and as the batch script's file name.
+
+    Returns True if the job was submitted (or would be, under --dry-run).
+    """
+    outfile.parent.mkdir(parents=True, exist_ok=True)
+    job_scripts_dir.mkdir(parents=True, exist_ok=True)
+
+    cmd = build_irf_command(infile, outfile, args)
+    if args.srun:
+        cmd = ["srun"] + cmd
+
+    job_name = "irf_" + _JOB_TAG_RE.sub("_", job_tag)[:56]
+
+    script_lines = [
+        "#!/bin/sh",
+        f"#SBATCH -p {args.sbatch_partition}",
+        f"#SBATCH -J {job_name}",
+        f"#SBATCH -o {job_scripts_dir}/{job_name}-%j.out",
+        f"#SBATCH --mem={args.sbatch_mem}",
+        "#SBATCH -N 1",
+    ]
+    if args.sbatch_exclusive:
+        script_lines.append("#SBATCH --exclusive")
+    script_lines += [
+        "",
+        "ulimit -l unlimited",
+        "ulimit -s unlimited",
+        "ulimit -a",
+        "",
+        " ".join(cmd),
+        "",
+    ]
+
+    job_script_path = job_scripts_dir / f"{job_name}.sh"
+    job_script_path.write_text("\n".join(script_lines))
+
+    command_elements = ["sbatch", str(job_script_path)]
+    log.info("Submitting: %s", " ".join(command_elements))
+    if args.dry_run:
+        return True
+    try:
+        subprocess.run(command_elements, check=True, capture_output=True, text=True)
+        return True
+    except subprocess.CalledProcessError as e:
+        log.error(
+            "sbatch submission failed for %s (return code %d)\nstdout: %s\nstderr: %s",
+            job_script_path, e.returncode, e.stdout, e.stderr,
+        )
+        return False
 
 
 def make_diagnostic_plots(irf_file, plot_dir, energy_dependent_gh):
@@ -386,6 +468,28 @@ def build_arg_parser():
         help="Prepend 'srun' to the lstchain_create_irf_files command line (SLURM clusters)",
     )
     parser.add_argument(
+        "--sbatch", action="store_true",
+        help="Submit each IRF creation as its own SLURM batch job (via sbatch) instead "
+             "of running lstchain_create_irf_files directly, so files are processed in "
+             "parallel across the cluster. Job scripts are written under "
+             f"<output-dir>/{JOB_SCRIPTS_SUBDIR}/. Diagnostic plots are skipped for "
+             "jobs submitted this way (see --skip-plots); the script does not wait "
+             "for the jobs to finish.",
+    )
+    parser.add_argument(
+        "--sbatch-partition", default="short",
+        help="SLURM partition for --sbatch jobs (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--sbatch-mem", default="5g",
+        help="SLURM --mem value for --sbatch jobs (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--no-sbatch-exclusive", dest="sbatch_exclusive", action="store_false",
+        help="Do not request exclusive node access (--exclusive) for --sbatch jobs "
+             "(requested by default)",
+    )
+    parser.add_argument(
         "--skip-plots", action="store_true",
         help="Do not generate diagnostic PNG plots for the produced IRF files",
     )
@@ -402,7 +506,7 @@ def build_arg_parser():
         help="Additional arguments appended verbatim to the lstchain_create_irf_files "
              "command line. Must be given last, after all other options.",
     )
-    parser.set_defaults(energy_dependent_gh=True, overwrite=True)
+    parser.set_defaults(energy_dependent_gh=True, overwrite=True, sbatch_exclusive=True)
     return parser
 
 
@@ -421,20 +525,28 @@ def main():
     target_dec = resolve_target_dec(args.target)
     fits_root = args.output_dir / FITS_SUBDIR
     plots_root = args.output_dir / PLOTS_SUBDIR
+    job_scripts_dir = args.output_dir / JOB_SCRIPTS_SUBDIR
     fits_root.mkdir(parents=True, exist_ok=True)
 
     log.info(
         "Run configuration: target='%s' (dec=%.4f deg), config=%s, "
         "mc_base_dir=%s, mc_tag=%s, dataset=%s, particle=%s, nsb=%s, "
-        "energy_dependent_gh=%s, overwrite=%s, srun=%s",
+        "energy_dependent_gh=%s, overwrite=%s, srun=%s, sbatch=%s",
         args.target, target_dec, args.config,
         args.mc_base_dir, args.mc_tag, args.dataset, args.particle, args.nsb_values,
-        args.energy_dependent_gh, args.overwrite, args.srun,
+        args.energy_dependent_gh, args.overwrite, args.srun, args.sbatch,
     )
+    if args.sbatch:
+        log.info(
+            "sbatch job settings: partition=%s, mem=%s, exclusive=%s, job_scripts_dir=%s",
+            args.sbatch_partition, args.sbatch_mem, args.sbatch_exclusive, job_scripts_dir,
+        )
     log.info("IRF FITS files will be written under: %s", fits_root)
     log.info("Diagnostic plots will be written under: %s", plots_root)
 
-    created_irf_files = []
+    created_irf_files = []  # (outfile, plot_dir) pairs ready to be plotted now
+    n_submitted = 0
+    n_skipped_existing = 0
     for nsb_val in args.nsb_values:
         particle_dir = (
             args.mc_base_dir
@@ -465,6 +577,20 @@ def main():
                 outfile = fits_root / rel_path
                 log.info("Input DL2 MC gamma file: %s", infile)
                 log.info("Output IRF FITS file: %s", outfile)
+
+                if args.sbatch:
+                    if outfile.exists() and not args.overwrite:
+                        log.info("Output file already exists: %s. Skipping.", outfile)
+                        n_skipped_existing += 1
+                        created_irf_files.append((outfile, plots_root / rel_path.parent))
+                        continue
+                    job_tag = f"nsb{nsb_val:.2f}_{dec_dir.name}_{outfile.stem}"
+                    if submit_lstchain_create_irf_files_job(
+                        infile, outfile, job_scripts_dir, args, job_tag
+                    ):
+                        n_submitted += 1
+                    continue
+
                 run_lstchain_create_irf_files(infile, outfile, args)
                 if args.dry_run:
                     continue
@@ -474,16 +600,32 @@ def main():
                 else:
                     log.error("Expected output file was not created: %s", outfile)
 
+    if args.sbatch and not args.dry_run:
+        log.info(
+            "Submitted %d sbatch job(s) (%d output file(s) already existed and were "
+            "skipped). Jobs run asynchronously; re-run this script (without --sbatch, "
+            "and without --skip-plots) once they finish to generate diagnostic plots "
+            "for the newly created files.",
+            n_submitted, n_skipped_existing,
+        )
+
     created_pngs = []
     if not args.skip_plots and not args.dry_run:
         for irf_file, plot_dir in created_irf_files:
             log.info("Creating diagnostic plots for %s in %s", irf_file, plot_dir)
             created_pngs += make_diagnostic_plots(irf_file, plot_dir, args.energy_dependent_gh)
 
-    log.info(
-        "Done. Created %d IRF FITS file(s) and %d diagnostic PNG file(s).",
-        len(created_irf_files), len(created_pngs),
-    )
+    if args.sbatch:
+        log.info(
+            "Done. Submitted %d IRF job(s), %d already existed, %d diagnostic PNG "
+            "file(s) created for pre-existing outputs.",
+            n_submitted, n_skipped_existing, len(created_pngs),
+        )
+    else:
+        log.info(
+            "Done. Created %d IRF FITS file(s) and %d diagnostic PNG file(s).",
+            len(created_irf_files), len(created_pngs),
+        )
 
 
 if __name__ == "__main__":
