@@ -331,7 +331,6 @@ def make_diagnostic_plots(irf_file, plot_dir, energy_dependent_gh):
     from astropy.table import QTable
     from gammapy.irf import EffectiveAreaTable2D, EnergyDispersion2D, PSF3D
     from matplotlib import pyplot as plt
-    import matplotlib.colors as colors
 
 
     base_name = irf_file.name
@@ -364,7 +363,7 @@ def make_diagnostic_plots(irf_file, plot_dir, energy_dependent_gh):
         aeff = EffectiveAreaTable2D.read(irf_file, hdu="EFFECTIVE AREA")
         fig, axes = plt.subplots(1, 3, figsize=(18, 5))
 
-        aeff.plot(ax=axes[0], norm=colors.LogNorm())
+        aeff.plot(ax=axes[0], norm="log")
         axes[0].set_title("Energy-offset dependence")
 
         aeff.plot_energy_dependence(ax=axes[1], offset=[0.5 * u.deg])
