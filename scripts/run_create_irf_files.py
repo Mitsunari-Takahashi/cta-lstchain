@@ -327,6 +327,7 @@ def make_diagnostic_plots(irf_file, plot_dir, energy_dependent_gh):
     # Imported lazily so that --skip-plots does not require gammapy/matplotlib.
     import matplotlib
     matplotlib.use("Agg")
+    import numpy as np
     import astropy.units as u
     from astropy.table import QTable
     from gammapy.irf import EffectiveAreaTable2D, EnergyDispersion2D, PSF3D
@@ -363,7 +364,21 @@ def make_diagnostic_plots(irf_file, plot_dir, energy_dependent_gh):
         aeff = EffectiveAreaTable2D.read(irf_file, hdu="EFFECTIVE AREA")
         fig, axes = plt.subplots(1, 3, figsize=(18, 5))
 
-        aeff.plot(ax=axes[0], norm="log")
+        # Effective area can be exactly 0 in some energy-offset bins (e.g.
+        # below threshold), which is invalid for a log-scaled color norm.
+        # Compute vmin/vmax ourselves (restricting vmin to positive values)
+        # and pass them explicitly so gammapy's own `kwargs.setdefault(...)`
+        # for vmin/vmax (using the raw, possibly-zero, nanmin) is not used.
+        energy_true = aeff.axes["energy_true"]
+        offset = aeff.axes["offset"]
+        aeff_values = aeff.evaluate(
+            offset=offset.center, energy_true=energy_true.center[:, np.newaxis]
+        ).value
+        positive_values = aeff_values[aeff_values > 0]
+        vmin = positive_values.min() if positive_values.size else 1e-10
+        vmax = aeff_values.max()
+
+        aeff.plot(ax=axes[0], norm="log", vmin=vmin, vmax=vmax)
         axes[0].set_title("Energy-offset dependence")
 
         aeff.plot_energy_dependence(ax=axes[1], offset=[0.5 * u.deg])
